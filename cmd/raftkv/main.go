@@ -28,6 +28,26 @@ func main() {
 	}
 	defer wal.Close()
 
+	// Initialize StateStore
+	stateStore, err := persistence.NewStateStore(*dataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize StateStore: %v", err)
+	}
+
+	term, votedFor, err := stateStore.Load()
+	if err != nil {
+		log.Fatalf("Failed to load state: %v", err)
+	}
+	log.Printf("Recovered Raft state. Term: %d, VotedFor: %s", term, votedFor)
+
+	if term == 0 {
+		if err := stateStore.Save(1, ""); err != nil {
+			log.Fatalf("Failed to save initial state: %v", err)
+		}
+		term = 1
+		log.Printf("Initialized fresh node with Term 1 (created state.json)")
+	}
+
 	// Recover from WAL
 	log.Printf("Recovering from WAL...")
 	entries, err := wal.ReadEntries()

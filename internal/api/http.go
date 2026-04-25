@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"log"
 	"net/http"
 	"raftkv/internal/persistence"
 	"raftkv/internal/raft"
@@ -32,6 +33,8 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Key is required", http.StatusBadRequest)
 		return
 	}
+
+	log.Printf("[API] GET /v1/keys/%s", key)
 
 	val, ok := s.sm.Get(key)
 	if !ok {
@@ -82,6 +85,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to append to WAL", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("[WAL] Appended entry Index=%d Term=%d Command=PUT(%s)", entry.Index, entry.Term, key)
 
 	res := s.sm.Apply(cmd)
 
@@ -89,6 +93,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, res.Error, http.StatusInternalServerError)
 		return
 	}
+	log.Printf("[SM] Applied PUT %s = %s", key, reqBody.Value)
 
 	w.WriteHeader(http.StatusCreated)
 }
@@ -122,6 +127,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Failed to append to WAL", http.StatusInternalServerError)
 		return
 	}
+	log.Printf("[WAL] Appended entry Index=%d Term=%d Command=DELETE(%s)", entry.Index, entry.Term, key)
 
 	res := s.sm.Apply(cmd)
 
@@ -129,11 +135,13 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, res.Error, http.StatusInternalServerError)
 		return
 	}
+	log.Printf("[SM] Applied DELETE %s", key)
 
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[API] GET /v1/keys")
 	keys := s.sm.Keys()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string][]string{"keys": keys})
