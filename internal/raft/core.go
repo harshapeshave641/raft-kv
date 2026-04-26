@@ -263,6 +263,15 @@ func (c *RaftCore) ProposeCommand(cmd []byte) (Index, Term, []Action) {
 		})
 	}
 
+	// Single node cluster: commit immediately
+	if c.config.Quorum() == 1 {
+		c.commitIndex = entry.Index
+		actions = append(actions, Action{
+			Type:        ActionCommit,
+			CommitIndex: c.commitIndex,
+		})
+	}
+
 	return entry.Index, entry.Term, actions
 }
 
