@@ -4,20 +4,17 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
-	"raftkv/internal/persistence"
 	"raftkv/internal/raft"
 	"raftkv/internal/store"
-	"sync/atomic"
 )
 
 type Server struct {
-	sm        *store.StateMachine
-	wal       *persistence.WAL
-	lastIndex *atomic.Uint64
+	node *raft.RaftNode
+	sm   *store.StateMachine
 }
 
-func NewServer(sm *store.StateMachine, wal *persistence.WAL, lastIndex *atomic.Uint64) *Server {
-	return &Server{sm: sm, wal: wal, lastIndex: lastIndex}
+func NewServer(node *raft.RaftNode, sm *store.StateMachine) *Server {
+	return &Server{node: node, sm: sm}
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
@@ -74,28 +71,16 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	index := s.lastIndex.Add(1)
-	entry := raft.LogEntry{
-		Term:    1,
-		Index:   raft.Index(index),
-		Command: cmdBytes,
-	}
-
-	if err := s.wal.AppendEntry(entry); err != nil {
-		http.Error(w, "Failed to append to WAL", http.StatusInternalServerError)
+	index, term := s.node.ProposeCommand(cmdBytes)
+	if index == 0 {
+		http.Error(w, "Not the leader", http.StatusTemporaryRedirect)
 		return
 	}
-	log.Printf("[WAL] Appended entry Index=%d Term=%d Command=PUT(%s)", entry.Index, entry.Term, key)
 
-	res := s.sm.Apply(cmd)
+	log.Printf("[API] Proposed PUT %s = %s (Index=%d, Term=%d)", key, reqBody.Value, index, term)
 
-	if res.Error != "" {
-		http.Error(w, res.Error, http.StatusInternalServerError)
-		return
-	}
-	log.Printf("[SM] Applied PUT %s = %s", key, reqBody.Value)
-
-	w.WriteHeader(http.StatusCreated)
+	// Since we are async and it might not be committed yet, return 202 Accepted
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -116,28 +101,15 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	index := s.lastIndex.Add(1)
-	entry := raft.LogEntry{
-		Term:    1,
-		Index:   raft.Index(index),
-		Command: cmdBytes,
-	}
-
-	if err := s.wal.AppendEntry(entry); err != nil {
-		http.Error(w, "Failed to append to WAL", http.StatusInternalServerError)
+	index, term := s.node.ProposeCommand(cmdBytes)
+	if index == 0 {
+		http.Error(w, "Not the leader", http.StatusTemporaryRedirect)
 		return
 	}
-	log.Printf("[WAL] Appended entry Index=%d Term=%d Command=DELETE(%s)", entry.Index, entry.Term, key)
 
-	res := s.sm.Apply(cmd)
+	log.Printf("[API] Proposed DELETE %s (Index=%d, Term=%d)", key, index, term)
 
-	if res.Error != "" {
-		http.Error(w, res.Error, http.StatusInternalServerError)
-		return
-	}
-	log.Printf("[SM] Applied DELETE %s", key)
-
-	w.WriteHeader(http.StatusNoContent)
+	w.WriteHeader(http.StatusAccepted)
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {

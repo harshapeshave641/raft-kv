@@ -6,14 +6,15 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"sync/atomic"
 
 	"raftkv/internal/api"
 	"raftkv/internal/persistence"
+	"raftkv/internal/raft"
 	"raftkv/internal/store"
 )
 
 func main() {
+	id := flag.String("id", "node1", "Node ID")
 	port := flag.Int("port", 3001, "HTTP server port")
 	dataDir := flag.String("data", "data", "Data directory")
 	flag.Parse()
@@ -34,41 +35,43 @@ func main() {
 		log.Fatalf("Failed to initialize StateStore: %v", err)
 	}
 
-	term, votedFor, err := stateStore.Load()
-	if err != nil {
-		log.Fatalf("Failed to load state: %v", err)
-	}
-	log.Printf("Recovered Raft state. Term: %d, VotedFor: %s", term, votedFor)
-
-	if term == 0 {
-		if err := stateStore.Save(1, ""); err != nil {
-			log.Fatalf("Failed to save initial state: %v", err)
-		}
-		term = 1
-		log.Printf("Initialized fresh node with Term 1 (created state.json)")
-	}
-
 	// Recover from WAL
 	log.Printf("Recovering from WAL...")
-	entries, err := wal.ReadEntries()
+	records, err := wal.ReadAll()
 	if err != nil {
 		log.Fatalf("Failed to read WAL entries: %v", err)
 	}
 
-	var lastIndex atomic.Uint64
-
-	for _, entry := range entries {
-		var cmd store.Command
-		if err := json.Unmarshal(entry.Command, &cmd); err != nil {
-			log.Fatalf("Failed to unmarshal command at index %d: %v", entry.Index, err)
+	raftLog := raft.NewRaftLog()
+	var entries []raft.LogEntry
+	for _, record := range records {
+		var entry raft.LogEntry
+		if err := json.Unmarshal(record, &entry); err != nil {
+			log.Fatalf("Failed to unmarshal log entry: %v", err)
 		}
-		sm.Apply(cmd)
-		lastIndex.Store(uint64(entry.Index))
+		entries = append(entries, entry)
 	}
-	log.Printf("Recovered %d entries. Last index: %d", len(entries), lastIndex.Load())
+	raftLog.Append(entries)
+	log.Printf("Recovered %d entries into RaftLog. Last index: %d", len(entries), raftLog.LastIndex())
+
+	// Single node cluster config for now
+	config := raft.ClusterConfig{
+		SelfID: raft.NodeID(*id),
+		Nodes: []raft.NodeConfig{
+			{ID: raft.NodeID(*id), Host: "localhost", Port: *port},
+		},
+	}
+
+	// Initialize the orchestrator
+	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, sm)
+	if err != nil {
+		log.Fatalf("Failed to initialize RaftNode: %v", err)
+	}
+
+	raftNode.Start() // starts the background election timer
 
 	// Initialize the HTTP API
-	apiServer := api.NewServer(sm, wal, &lastIndex)
+	apiServer := api.NewServer(raftNode, sm)
 
 	// Register routes
 	mux := http.NewServeMux()
