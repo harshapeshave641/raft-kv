@@ -204,26 +204,28 @@ func (n *RaftNode) startHeartbeatTickerLocked() {
 	actions := n.core.HandleHeartbeatTick()
 	n.executeActions(actions)
 
-	n.heartbeatTicker = time.NewTicker(50 * time.Millisecond)
-	go func() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	n.heartbeatTicker = ticker
+	go func(t *time.Ticker) {
 		for {
 			select {
 			case <-n.stopChan:
+				t.Stop()
 				return
-			case <-n.heartbeatTicker.C:
+			case <-t.C:
 				n.mu.Lock()
-				if n.core.State() == Leader {
+				if n.core.State() == Leader && n.heartbeatTicker == t {
 					actions := n.core.HandleHeartbeatTick()
 					n.executeActions(actions)
 				} else {
-					n.heartbeatTicker.Stop()
+					t.Stop()
 					n.mu.Unlock()
-					return // stop if we stepped down
+					return // stop if we stepped down or a new ticker started
 				}
 				n.mu.Unlock()
 			}
 		}
-	}()
+	}(ticker)
 }
 
 // resetElectionTimerLocked sets a new randomized timeout (150-300ms).
