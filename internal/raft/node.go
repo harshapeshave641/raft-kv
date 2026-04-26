@@ -26,6 +26,8 @@ type RaftNode struct {
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
 	stopChan        chan struct{}
+
+	lastTimerResetLog time.Time // To throttle noise
 }
 
 // NewRaftNode creates a new RaftNode orchestrator.
@@ -153,7 +155,10 @@ func (n *RaftNode) executeActions(actions []Action) {
 			}
 
 		case ActionResetElectionTimer:
-			log.Printf("[RaftNode] Resetting election timer")
+			if time.Since(n.lastTimerResetLog) > 5*time.Second {
+				log.Printf("[RaftNode] Resetting election timer (throttled)...")
+				n.lastTimerResetLog = time.Now()
+			}
 			n.resetElectionTimerLocked()
 
 		case ActionSendRequestVote:
