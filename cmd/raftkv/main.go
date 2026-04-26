@@ -6,10 +6,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"raftkv/internal/api"
 	"raftkv/internal/persistence"
 	"raftkv/internal/raft"
+	"raftkv/internal/rpc"
 	"raftkv/internal/store"
 )
 
@@ -17,6 +20,7 @@ func main() {
 	id := flag.String("id", "node1", "Node ID")
 	port := flag.Int("port", 3001, "HTTP server port")
 	dataDir := flag.String("data", "data", "Data directory")
+	peersFlag := flag.String("peers", "", "Comma-separated list of peers (e.g. node2=localhost:3002,node3=localhost:3003)")
 	flag.Parse()
 
 	// Initialize the Phase 1 state machine
@@ -54,16 +58,67 @@ func main() {
 	raftLog.Append(entries)
 	log.Printf("Recovered %d entries into RaftLog. Last index: %d", len(entries), raftLog.LastIndex())
 
-	// Single node cluster config for now
-	config := raft.ClusterConfig{
-		SelfID: raft.NodeID(*id),
-		Nodes: []raft.NodeConfig{
-			{ID: raft.NodeID(*id), Host: "localhost", Port: *port},
-		},
+	// Replay committed entries into State Machine
+	var lastApplied raft.Index = 0
+	// For now, we assume everything in the WAL was committed on restart.
+	// In a full Raft implementation, this would be drive by the persistent commitIndex or Snapshot.
+	for _, entry := range entries {
+		var cmd store.Command
+		if err := json.Unmarshal(entry.Command, &cmd); err != nil {
+			log.Printf("Warning: Failed to unmarshal command at index %d: %v", entry.Index, err)
+			continue
+		}
+		sm.Apply(cmd)
+		lastApplied = entry.Index
+	}
+	if lastApplied > 0 {
+		log.Printf("Replayed %d entries into State Machine. Current index: %d", len(entries), lastApplied)
 	}
 
+	// Build ClusterConfig
+	var nodes []raft.NodeConfig
+	nodes = append(nodes, raft.NodeConfig{
+		ID:   raft.NodeID(*id),
+		Host: "localhost",
+		Port: *port,
+	})
+
+	if *peersFlag != "" {
+		peerPairs := strings.Split(*peersFlag, ",")
+		for _, pair := range peerPairs {
+			parts := strings.Split(pair, "=")
+			if len(parts) != 2 {
+				log.Fatalf("Invalid peer format: %s", pair)
+			}
+			peerID := parts[0]
+			address := parts[1] // e.g. localhost:3002
+
+			hostPort := strings.Split(address, ":")
+			if len(hostPort) != 2 {
+				log.Fatalf("Invalid address format: %s", address)
+			}
+			p, err := strconv.Atoi(hostPort[1])
+			if err != nil {
+				log.Fatalf("Invalid port in address: %s", address)
+			}
+
+			nodes = append(nodes, raft.NodeConfig{
+				ID:   raft.NodeID(peerID),
+				Host: hostPort[0],
+				Port: p,
+			})
+		}
+	}
+
+	config := raft.ClusterConfig{
+		SelfID: raft.NodeID(*id),
+		Nodes:  nodes,
+	}
+
+	transport := rpc.NewHTTPTransport()
+
 	// Initialize the orchestrator
-	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, sm)
+	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, sm, transport, lastApplied)
 	if err != nil {
 		log.Fatalf("Failed to initialize RaftNode: %v", err)
 	}

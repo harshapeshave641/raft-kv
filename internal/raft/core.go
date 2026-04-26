@@ -275,6 +275,31 @@ func (c *RaftCore) ProposeCommand(cmd []byte) (Index, Term, []Action) {
 	return entry.Index, entry.Term, actions
 }
 
+// HandleHeartbeatTick is called periodically by the leader to send AppendEntries (heartbeats).
+func (c *RaftCore) HandleHeartbeatTick() []Action {
+	if c.state != Leader {
+		return nil
+	}
+
+	var actions []Action
+	for _, peer := range c.config.Peers() {
+		prevLogIndex := c.nextIndex[peer.ID] - 1
+		actions = append(actions, Action{
+			Type: ActionSendAppendEntries,
+			To:   peer.ID,
+			AppendEntriesArgs: &AppendEntriesArgs{
+				Term:         c.currentTerm,
+				LeaderID:     c.selfID,
+				PrevLogIndex: prevLogIndex,
+				PrevLogTerm:  c.log.TermAt(prevLogIndex),
+				Entries:      c.log.GetEntriesFrom(c.nextIndex[peer.ID]),
+				LeaderCommit: c.commitIndex,
+			},
+		})
+	}
+	return actions
+}
+
 // HandleAppendEntriesRequest handles replication and heartbeats from leader.
 func (c *RaftCore) HandleAppendEntriesRequest(args AppendEntriesArgs) (AppendEntriesReply, []Action) {
 	var actions []Action

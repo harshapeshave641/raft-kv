@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 // NodeID uniquely identifies a node in the Raft cluster.
 type NodeID string
 
@@ -78,6 +80,15 @@ func (c *ClusterConfig) Peers() []NodeConfig {
 		}
 	}
 	return peers
+}
+
+func (c *ClusterConfig) GetPeerAddress(id NodeID) string {
+	for _, n := range c.Nodes {
+		if n.ID == id {
+			return n.Host + ":" + fmt.Sprint(n.Port)
+		}
+	}
+	return ""
 }
 
 type RequestVoteArgs struct {

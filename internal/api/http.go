@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"raftkv/internal/raft"
@@ -18,10 +19,15 @@ func NewServer(node *raft.RaftNode, sm *store.StateMachine) *Server {
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
+	// Client API routes
 	mux.HandleFunc("GET /v1/keys/{key}", s.handleGet)
 	mux.HandleFunc("PUT /v1/keys/{key}", s.handlePut)
 	mux.HandleFunc("DELETE /v1/keys/{key}", s.handleDelete)
 	mux.HandleFunc("GET /v1/keys", s.handleList)
+
+	// Internal Raft RPC routes
+	mux.HandleFunc("POST /raft/request-vote", s.handleRequestVote)
+	mux.HandleFunc("POST /raft/append-entries", s.handleAppendEntries)
 }
 
 func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
@@ -32,6 +38,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[API] GET /v1/keys/%s", key)
+	
+	if s.node.State() != raft.Leader {
+		leaderID := s.node.LeaderID()
+		http.Error(w, fmt.Sprintf("Not the leader. Current leader: %s", leaderID), http.StatusTemporaryRedirect)
+		return
+	}
 
 	val, ok := s.sm.Get(key)
 	if !ok {
@@ -114,7 +126,36 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[API] GET /v1/keys")
+
+	if s.node.State() != raft.Leader {
+		leaderID := s.node.LeaderID()
+		http.Error(w, fmt.Sprintf("Not the leader. Current leader: %s", leaderID), http.StatusTemporaryRedirect)
+		return
+	}
+
 	keys := s.sm.Keys()
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string][]string{"keys": keys})
+}
+
+func (s *Server) handleRequestVote(w http.ResponseWriter, r *http.Request) {
+	var args raft.RequestVoteArgs
+	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		http.Error(w, "Invalid body", http.StatusBadRequest)
+		return
+	}
+	reply := s.node.HandleRequestVote(args)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(reply)
+}
+
+func (s *Server) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
+	var args raft.AppendEntriesArgs
+	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
+		http.Error(w, "Invalid body", http.StatusBadRequest)
+		return
+	}
+	reply := s.node.HandleAppendEntriesRequest(args)
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(reply)
 }

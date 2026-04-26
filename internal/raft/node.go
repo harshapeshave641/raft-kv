@@ -20,10 +20,12 @@ type RaftNode struct {
 	wal           *persistence.WAL
 	raftLog       *RaftLog
 	stateMachine  *store.StateMachine
+	transport     Transport
 	lastApplied   Index
 
-	electionTimer *time.Timer
-	stopChan      chan struct{}
+	electionTimer   *time.Timer
+	heartbeatTicker *time.Ticker
+	stopChan        chan struct{}
 }
 
 // NewRaftNode creates a new RaftNode orchestrator.
@@ -33,6 +35,8 @@ func NewRaftNode(
 	stateStore *persistence.StateStore,
 	wal *persistence.WAL,
 	stateMachine *store.StateMachine,
+	transport Transport,
+	lastApplied Index,
 ) (*RaftNode, error) {
 	// Load persisted state (if any)
 	term, votedFor, err := stateStore.Load()
@@ -53,7 +57,8 @@ func NewRaftNode(
 		wal:          wal,
 		raftLog:      raftLog,
 		stateMachine: stateMachine,
-		lastApplied:  0,
+		transport:    transport,
+		lastApplied:  lastApplied,
 		stopChan:     make(chan struct{}),
 	}, nil
 }
@@ -86,6 +91,13 @@ func (n *RaftNode) CurrentTerm() Term {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return n.core.CurrentTerm()
+}
+
+// LeaderID returns the current leader ID if known (safe for concurrent use).
+func (n *RaftNode) LeaderID() NodeID {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.core.LeaderID()
 }
 
 // executeActions runs the physical side effects returned by the pure RaftCore.
@@ -139,24 +151,83 @@ func (n *RaftNode) executeActions(actions []Action) {
 			n.resetElectionTimerLocked()
 
 		case ActionSendRequestVote:
-			log.Printf("[RaftNode] Emulating sending RequestVote to %s for Term %d", action.To, action.RequestVoteArgs.Term)
-			// TODO (Phase 5): Spin up a goroutine here to actually send the RPC over network
+			peerAddress := n.core.config.GetPeerAddress(action.To)
+			go func(peerID NodeID, addr string, args RequestVoteArgs) {
+				log.Printf("[RaftNode] Sending RequestVote to %s at %s for Term %d", peerID, addr, args.Term)
+				reply, err := n.transport.SendRequestVote(peerID, addr, args)
+				if err != nil {
+					log.Printf("[RaftNode] Failed to send RequestVote to %s: %v", peerID, err)
+					return
+				}
+				n.HandleRequestVoteResponse(peerID, reply)
+			}(action.To, peerAddress, *action.RequestVoteArgs)
 		
 		case ActionSendAppendEntries:
-			log.Printf("[RaftNode] Emulating sending AppendEntries to %s for Term %d", action.To, action.AppendEntriesArgs.Term)
+			peerAddress := n.core.config.GetPeerAddress(action.To)
+			go func(peerID NodeID, addr string, args AppendEntriesArgs) {
+				// Don't log heartbeats to avoid spam
+				if len(args.Entries) > 0 {
+					log.Printf("[RaftNode] Sending AppendEntries to %s at %s with %d entries", peerID, addr, len(args.Entries))
+				}
+				reply, err := n.transport.SendAppendEntries(peerID, addr, args)
+				if err != nil {
+					// Also don't spam errors for missing heartbeats
+					return
+				}
+				n.HandleAppendEntriesResponse(peerID, reply, args)
+			}(action.To, peerAddress, *action.AppendEntriesArgs)
 
 		case ActionBecomeLeader:
 			log.Printf("[RaftNode] Elected LEADER for term %d!", action.Term)
 			n.core.SetLeader()
-			// TODO (Phase 5): Start sending heartbeats immediately
+			n.startHeartbeatTickerLocked()
 		}
 	}
+}
+
+// startHeartbeatTickerLocked starts sending periodic heartbeats.
+func (n *RaftNode) startHeartbeatTickerLocked() {
+	if n.electionTimer != nil {
+		n.electionTimer.Stop()
+	}
+	if n.heartbeatTicker != nil {
+		n.heartbeatTicker.Stop()
+	}
+
+	// Send initial heartbeat immediately
+	actions := n.core.HandleHeartbeatTick()
+	n.executeActions(actions)
+
+	n.heartbeatTicker = time.NewTicker(50 * time.Millisecond)
+	go func() {
+		for {
+			select {
+			case <-n.stopChan:
+				return
+			case <-n.heartbeatTicker.C:
+				n.mu.Lock()
+				if n.core.State() == Leader {
+					actions := n.core.HandleHeartbeatTick()
+					n.executeActions(actions)
+				} else {
+					n.heartbeatTicker.Stop()
+					n.mu.Unlock()
+					return // stop if we stepped down
+				}
+				n.mu.Unlock()
+			}
+		}
+	}()
 }
 
 // resetElectionTimerLocked sets a new randomized timeout (150-300ms).
 func (n *RaftNode) resetElectionTimerLocked() {
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
+	}
+	if n.heartbeatTicker != nil {
+		n.heartbeatTicker.Stop()
+		n.heartbeatTicker = nil
 	}
 
 	// Randomized timeout between 150ms and 300ms
