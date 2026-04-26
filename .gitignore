@@ -2,4 +2,11 @@
 /build/
 *.exe
 raft-kv
+raftkv
+
+# Data directories
 data/
+data*/
+
+# Temporary test files
+body*.json
