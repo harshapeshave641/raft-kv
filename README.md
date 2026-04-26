@@ -2,7 +2,7 @@
 
 RaftKV is a strongly consistent, fault-tolerant, and durable distributed key-value store built in Go using the **Raft Consensus Algorithm**. It is designed for systems where data integrity and high availability are paramount.
 
-## 🏗️ Architecture
+##  Architecture
 
 The system is built on a modular, decoupled architecture that separates pure logic from side effects, making it highly testable and resilient.
 
@@ -26,7 +26,7 @@ The system is built on a modular, decoupled architecture that separates pure log
 
 ---
 
-## 🚀 Getting Started
+##  Getting Started
 
 ### **Prerequisites**
 *   Go 1.22 or higher
@@ -57,7 +57,7 @@ Open three terminal windows and run the following commands to start a local clus
 
 ---
 
-## 📡 Client API Reference
+##  Client API Reference
 
 All write operations must go through the **Leader**. Reads are also restricted to the Leader to ensure **Linearizability**.
 
@@ -85,7 +85,7 @@ curl http://localhost:3001/v1/keys
 
 ---
 
-## 🧪 Testing and Fault Tolerance
+##  Testing and Fault Tolerance
 
 ### **Automatic Recovery**
 Upon startup, the server automatically:
@@ -107,7 +107,7 @@ go test ./internal/raft/...
 
 ---
 
-## 🛠️ Tech Stack
+##  Tech Stack
 *   **Language:** Go (Standard Library)
 *   **Consensus:** Raft (Strongly Consistent)
 *   **Transport:** JSON over HTTP/1.1
