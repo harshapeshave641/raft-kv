@@ -9,8 +9,6 @@ import (
     "os"
     "path/filepath"
     "sync"
-
-    "raftkv/internal/raft"
 )
 
 const walMagic uint32 = 0xDEADCAFE
@@ -124,9 +122,9 @@ func (w *WAL) ReadAll() ([][]byte, error) {
     return w.readAllLocked()
 }
 
-// TruncateTo rewrites the WAL keeping only the last n records.
-// Used to prevent unbounded WAL growth (called after snapshotting — future phase).
-func (w *WAL) TruncateTo(keepLast int) error {
+// TruncateFromIndex rewrites the WAL keeping only records with an Index strictly less than the given index.
+// Used when a follower detects conflicting entries from the leader.
+func (w *WAL) TruncateFromIndex(index uint64) error {
     w.mu.Lock()
     defer w.mu.Unlock()
 
@@ -135,11 +133,23 @@ func (w *WAL) TruncateTo(keepLast int) error {
         return err
     }
 
-    if len(all) <= keepLast {
-        return nil // nothing to do
+    var keep [][]byte
+    for _, record := range all {
+        var entry struct {
+            Index uint64 `json:"Index"`
+        }
+        if err := json.Unmarshal(record, &entry); err != nil {
+            return err // corrupted JSON
+        }
+        if entry.Index >= index {
+            break // discard this and all following
+        }
+        keep = append(keep, record)
     }
 
-    keep := all[len(all)-keepLast:]
+    if len(keep) == len(all) {
+        return nil // nothing to do
+    }
 
     // Write to temp file
     tmpPath := filepath.Join(w.dataDir, "wal.tmp")
@@ -186,41 +196,4 @@ func (w *WAL) Close() error {
     w.mu.Lock()
     defer w.mu.Unlock()
     return w.file.Close()
-}
-
-// AppendEntry serializes a LogEntry and appends it to the WAL.
-// This is the true incremental log method.
-func (w *WAL) AppendEntry(entry raft.LogEntry) error {
-    data, err := json.Marshal(entry)
-    if err != nil {
-        return err
-    }
-    return w.Append(data)
-}
-
-// ReadEntries reads the entire WAL and unmarshals each record into a LogEntry.
-// Validates that the Index increases monotonically.
-func (w *WAL) ReadEntries() ([]raft.LogEntry, error) {
-    records, err := w.ReadAll()
-    if err != nil {
-        return nil, err
-    }
-    
-    var entries []raft.LogEntry
-    var lastIndex raft.Index = 0
-    
-    for _, record := range records {
-        var entry raft.LogEntry
-        if err := json.Unmarshal(record, &entry); err != nil {
-            return nil, err
-        }
-        
-        if lastIndex > 0 && entry.Index <= lastIndex {
-            return nil, errors.New("corrupted WAL: index did not increase monotonically")
-        }
-        
-        entries = append(entries, entry)
-        lastIndex = entry.Index
-    }
-    return entries, nil
 }

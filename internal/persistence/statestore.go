@@ -5,8 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-
-	"raftkv/internal/raft"
 )
 
 // StateStore persists currentTerm and votedFor.
@@ -27,14 +25,14 @@ func NewStateStore(dataDir string) (*StateStore, error) {
 }
 
 type raftMetadata struct {
-	CurrentTerm raft.Term   `json:"current_term"`
-	VotedFor    raft.NodeID `json:"voted_for"`
+	CurrentTerm uint64 `json:"current_term"`
+	VotedFor    string `json:"voted_for"`
 }
 
 // Save writes currentTerm and votedFor to disk atomically.
 // Uses write-to-temp + fsync + rename — same pattern as your WAL.
 // NEVER returns without fsyncing.
-func (s *StateStore) Save(term raft.Term, votedFor raft.NodeID) error {
+func (s *StateStore) Save(term uint64, votedFor string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -73,7 +71,7 @@ func (s *StateStore) Save(term raft.Term, votedFor raft.NodeID) error {
 
 // Load reads currentTerm and votedFor from disk.
 // Returns zero values if file doesn't exist (fresh node).
-func (s *StateStore) Load() (term raft.Term, votedFor raft.NodeID, err error) {
+func (s *StateStore) Load() (term uint64, votedFor string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
