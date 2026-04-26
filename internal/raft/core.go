@@ -1,5 +1,7 @@
 package raft
 
+import "log"
+
 // RaftCore is a pure state machine.
 // Zero goroutines. Zero I/O. Zero network calls.
 // Every method takes input, returns []Action.
@@ -83,12 +85,15 @@ func (c *RaftCore) HandleElectionTimeout() []Action {
 
     // Single node cluster — quorum is 1, win immediately
     if c.config.Quorum() == 1 {
+        log.Printf("[RaftCore] Single node cluster. Automatically becoming Leader for Term %d", c.currentTerm)
         actions = append(actions, Action{
             Type: ActionBecomeLeader,
             Term: c.currentTerm,
         })
         return actions
     }
+
+    log.Printf("[RaftCore] Starting election for Term %d", c.currentTerm)
 
     // Multi-node — send RequestVote to all peers
     // (implemented in next baby step)
@@ -125,6 +130,7 @@ func (c *RaftCore) SetLeader() {
 // StepDown reverts node to follower with the given term.
 // Called when a higher term is seen in any message.
 func (c *RaftCore) StepDown(term Term) []Action {
+    log.Printf("[RaftCore] Stepping down to Follower for Term %d", term)
     c.state       = Follower
     c.currentTerm = term
     c.votedFor    = ""
@@ -175,6 +181,7 @@ func (c *RaftCore) HandleRequestVoteRequest(args RequestVoteArgs) (RequestVoteRe
 		(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
 
 	if (c.votedFor == "" || c.votedFor == args.CandidateID) && logIsUpToDate {
+		log.Printf("[RaftCore] Granting vote to %s for Term %d", args.CandidateID, args.Term)
 		c.votedFor = args.CandidateID
 		reply.VoteGranted = true
 		
@@ -215,6 +222,7 @@ func (c *RaftCore) HandleRequestVoteResponse(peer NodeID, reply RequestVoteReply
 
 	if reply.Term == c.currentTerm && reply.VoteGranted {
 		c.votesReceived[peer] = true
+		log.Printf("[RaftCore] Received vote from %s. Total votes: %d/%d", peer, len(c.votesReceived), c.config.Quorum())
 		
 		if len(c.votesReceived) >= c.config.Quorum() {
 			return []Action{{
@@ -336,6 +344,7 @@ func (c *RaftCore) HandleAppendEntriesRequest(args AppendEntriesArgs) (AppendEnt
 	if args.PrevLogIndex > 0 {
 		termAtPrev := c.log.TermAt(args.PrevLogIndex)
 		if termAtPrev != args.PrevLogTerm {
+			log.Printf("[RaftCore] Rejecting AppendEntries from %s: log inconsistency at index %d (expected term %d, got %d)", args.LeaderID, args.PrevLogIndex, args.PrevLogTerm, termAtPrev)
 			return reply, actions
 		}
 	}
@@ -360,6 +369,7 @@ func (c *RaftCore) HandleAppendEntriesRequest(args AppendEntriesArgs) (AppendEnt
 	}
 
 	if newEntriesIndex < len(args.Entries) {
+		log.Printf("[RaftCore] Appending %d new entries to local log", len(args.Entries)-newEntriesIndex)
 		actions = append(actions, Action{
 			Type:          ActionAppendLog,
 			TruncateIndex: insertIndex,
@@ -371,15 +381,19 @@ func (c *RaftCore) HandleAppendEntriesRequest(args AppendEntriesArgs) (AppendEnt
 
 	if args.LeaderCommit > c.commitIndex {
 		lastNewEntryIndex := args.PrevLogIndex + Index(len(args.Entries))
+		oldCommit := c.commitIndex
 		if args.LeaderCommit < lastNewEntryIndex {
 			c.commitIndex = args.LeaderCommit
 		} else {
 			c.commitIndex = lastNewEntryIndex
 		}
-		actions = append(actions, Action{
-			Type:        ActionCommit,
-			CommitIndex: c.commitIndex,
-		})
+		if c.commitIndex > oldCommit {
+			log.Printf("[RaftCore] Advancing commitIndex to %d (was %d)", c.commitIndex, oldCommit)
+			actions = append(actions, Action{
+				Type:        ActionCommit,
+				CommitIndex: c.commitIndex,
+			})
+		}
 	}
 
 	return reply, actions
@@ -419,7 +433,9 @@ func (c *RaftCore) HandleAppendEntriesResponse(peer NodeID, reply AppendEntriesR
 			}
 
 			if count >= c.config.Quorum() {
+				oldCommit := c.commitIndex
 				c.commitIndex = N
+				log.Printf("[RaftCore] Majority reached for index %d. Advancing commitIndex to %d (was %d)", N, c.commitIndex, oldCommit)
 				actions = append(actions, Action{
 					Type:        ActionCommit,
 					CommitIndex: c.commitIndex,

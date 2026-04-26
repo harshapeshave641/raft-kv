@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
 
@@ -29,6 +30,7 @@ func (t *HTTPTransport) SendRequestVote(peerID raft.NodeID, peerAddress string, 
 	}
 
 	url := fmt.Sprintf("http://%s/raft/request-vote", peerAddress)
+	log.Printf("[HTTPTransport] POST %s", url)
 	resp, err := t.client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return raft.RequestVoteReply{}, err
@@ -49,6 +51,10 @@ func (t *HTTPTransport) SendAppendEntries(peerID raft.NodeID, peerAddress string
 	}
 
 	url := fmt.Sprintf("http://%s/raft/append-entries", peerAddress)
+	// Don't log heartbeats to avoid spam, but log if there are entries
+	if len(args.Entries) > 0 {
+		log.Printf("[HTTPTransport] POST %s (%d entries)", url, len(args.Entries))
+	}
 	resp, err := t.client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return raft.AppendEntriesReply{}, err

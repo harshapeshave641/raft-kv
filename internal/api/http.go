@@ -144,6 +144,7 @@ func (s *Server) handleRequestVote(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid body", http.StatusBadRequest)
 		return
 	}
+	log.Printf("[API] Received RequestVote from %s for Term %d", args.CandidateID, args.Term)
 	reply := s.node.HandleRequestVote(args)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(reply)
@@ -154,6 +155,9 @@ func (s *Server) handleAppendEntries(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&args); err != nil {
 		http.Error(w, "Invalid body", http.StatusBadRequest)
 		return
+	}
+	if len(args.Entries) > 0 {
+		log.Printf("[API] Received AppendEntries from %s for Term %d (%d entries)", args.LeaderID, args.Term, len(args.Entries))
 	}
 	reply := s.node.HandleAppendEntriesRequest(args)
 	w.Header().Set("Content-Type", "application/json")

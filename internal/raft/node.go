@@ -106,6 +106,7 @@ func (n *RaftNode) executeActions(actions []Action) {
 	for _, action := range actions {
 		switch action.Type {
 		case ActionPersistState:
+			log.Printf("[RaftNode] Persisting state: Term=%d, VotedFor=%s", action.State.CurrentTerm, action.State.VotedFor)
 			// Write CurrentTerm and VotedFor to state.json
 			if err := n.stateStore.Save(uint64(action.State.CurrentTerm), string(action.State.VotedFor)); err != nil {
 				log.Printf("[RaftNode] ERROR: Failed to persist state: %v", err)
@@ -113,10 +114,14 @@ func (n *RaftNode) executeActions(actions []Action) {
 		
 		case ActionAppendLog:
 			if action.TruncateIndex > 0 {
+				log.Printf("[RaftNode] Truncating log from index %d", action.TruncateIndex)
 				if err := n.wal.TruncateFromIndex(uint64(action.TruncateIndex)); err != nil {
 					log.Printf("[RaftNode] ERROR: WAL TruncateFromIndex failed: %v", err)
 				}
 				n.raftLog.TruncateFrom(action.TruncateIndex)
+			}
+			if len(action.LogEntries) > 0 {
+				log.Printf("[RaftNode] Writing %d entries to WAL", len(action.LogEntries))
 			}
 			for _, entry := range action.LogEntries {
 				data, err := json.Marshal(entry)
@@ -148,6 +153,7 @@ func (n *RaftNode) executeActions(actions []Action) {
 			}
 
 		case ActionResetElectionTimer:
+			log.Printf("[RaftNode] Resetting election timer")
 			n.resetElectionTimerLocked()
 
 		case ActionSendRequestVote:
@@ -266,6 +272,7 @@ func (n *RaftNode) HandleRequestVoteResponse(peer NodeID, reply RequestVoteReply
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	log.Printf("[RaftNode] Received RequestVoteResponse from %s: Granted=%v, Term=%d", peer, reply.VoteGranted, reply.Term)
 	actions := n.core.HandleRequestVoteResponse(peer, reply)
 	n.executeActions(actions)
 }
@@ -285,6 +292,9 @@ func (n *RaftNode) HandleAppendEntriesResponse(peer NodeID, reply AppendEntriesR
 	n.mu.Lock()
 	defer n.mu.Unlock()
 
+	if len(args.Entries) > 0 {
+		log.Printf("[RaftNode] Received AppendEntriesResponse from %s: Success=%v, Term=%d", peer, reply.Success, reply.Term)
+	}
 	actions := n.core.HandleAppendEntriesResponse(peer, reply, args)
 	n.executeActions(actions)
 }
