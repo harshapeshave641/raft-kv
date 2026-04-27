@@ -102,6 +102,13 @@ func (n *RaftNode) LeaderID() NodeID {
 	return n.core.LeaderID()
 }
 
+// CommitIndex returns the current commit index (safe for concurrent use).
+func (n *RaftNode) CommitIndex() Index {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.core.commitIndex
+}
+
 // executeActions runs the physical side effects returned by the pure RaftCore.
 // Must be called with n.mu held.
 func (n *RaftNode) executeActions(actions []Action) {

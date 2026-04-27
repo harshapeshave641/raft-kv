@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 	"raftkv/internal/raft"
 	"raftkv/internal/store"
 )
@@ -91,8 +92,27 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[API] Proposed PUT %s = %s (Index=%d, Term=%d)", key, reqBody.Value, index, term)
 
-	// Since we are async and it might not be committed yet, return 202 Accepted
-	w.WriteHeader(http.StatusAccepted)
+	// Wait for the command to be committed before returning success
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			http.Error(w, "Command not committed within timeout", http.StatusRequestTimeout)
+			return
+		case <-ticker.C:
+			if s.node.State() != raft.Leader {
+				http.Error(w, "No longer the leader", http.StatusTemporaryRedirect)
+				return
+			}
+			if s.node.CommitIndex() >= index {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
@@ -121,7 +141,27 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[API] Proposed DELETE %s (Index=%d, Term=%d)", key, index, term)
 
-	w.WriteHeader(http.StatusAccepted)
+	// Wait for the command to be committed before returning success
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			http.Error(w, "Command not committed within timeout", http.StatusRequestTimeout)
+			return
+		case <-ticker.C:
+			if s.node.State() != raft.Leader {
+				http.Error(w, "No longer the leader", http.StatusTemporaryRedirect)
+				return
+			}
+			if s.node.CommitIndex() >= index {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+	}
 }
 
 func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
