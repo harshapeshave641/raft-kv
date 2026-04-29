@@ -34,6 +34,27 @@ func (sm *StateMachine) Apply(cmd Command) CommandResult {
 	}
 }
 
+func (sm *StateMachine) Snapshot() map[string]string {
+	sm.mu.RLock()
+	defer sm.mu.RUnlock()
+
+	snapshot := make(map[string]string, len(sm.data))
+	for k, v := range sm.data {
+		snapshot[k] = v
+	}
+	return snapshot
+}
+
+func (sm *StateMachine) Restore(snapshot map[string]string) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+
+	sm.data = make(map[string]string, len(snapshot))
+	for k, v := range snapshot {
+		sm.data[k] = v
+	}
+}
+
 func (sm *StateMachine) Get(key string) (string, bool) {
 	sm.mu.RLock()
 	defer sm.mu.RUnlock()
