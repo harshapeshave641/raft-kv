@@ -11,7 +11,7 @@ import (
 	"raftkv/internal/store"
 )
 
-const snapshotThreshold = 5
+const snapshotThreshold = 200
 
 // RaftNode is the multi-threaded orchestrator that wraps the pure RaftCore.
 // It handles timers, locks, network RPCs, and physical disk writes.
