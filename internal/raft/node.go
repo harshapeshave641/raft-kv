@@ -11,6 +11,8 @@ import (
 	"raftkv/internal/store"
 )
 
+const snapshotThreshold = 5
+
 // RaftNode is the multi-threaded orchestrator that wraps the pure RaftCore.
 // It handles timers, locks, network RPCs, and physical disk writes.
 type RaftNode struct {
@@ -21,7 +23,9 @@ type RaftNode struct {
 	raftLog       *RaftLog
 	stateMachine  *store.StateMachine
 	transport     Transport
+	snapshotStore *persistence.SnapshotStore
 	lastApplied   Index
+	snapshotIndex Index
 
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
@@ -36,6 +40,7 @@ func NewRaftNode(
 	raftLog *RaftLog,
 	stateStore *persistence.StateStore,
 	wal *persistence.WAL,
+	snapshotStore *persistence.SnapshotStore,
 	stateMachine *store.StateMachine,
 	transport Transport,
 	lastApplied Index,
@@ -54,14 +59,16 @@ func NewRaftNode(
 	core := NewRaftCore(config, raftLog, persisted)
 
 	return &RaftNode{
-		core:         core,
-		stateStore:   stateStore,
-		wal:          wal,
-		raftLog:      raftLog,
+		core:          core,
+		stateStore:    stateStore,
+		wal:           wal,
+		raftLog:       raftLog,
 		stateMachine: stateMachine,
-		transport:    transport,
-		lastApplied:  lastApplied,
-		stopChan:     make(chan struct{}),
+		transport:     transport,
+		snapshotStore: snapshotStore,
+		lastApplied:   lastApplied,
+		snapshotIndex: lastApplied,
+		stopChan:      make(chan struct{}),
 	}, nil
 }
 
@@ -160,6 +167,7 @@ func (n *RaftNode) executeActions(actions []Action) {
 					log.Printf("[RaftNode] APPLIED command at index %d: %+v", n.lastApplied, cmd)
 				}
 			}
+			n.maybeCreateSnapshotLocked()
 
 		case ActionResetElectionTimer:
 			if time.Since(n.lastTimerResetLog) > 5*time.Second {
@@ -201,6 +209,33 @@ func (n *RaftNode) executeActions(actions []Action) {
 			n.startHeartbeatTickerLocked()
 		}
 	}
+}
+
+func (n *RaftNode) maybeCreateSnapshotLocked() {
+	if n.snapshotStore == nil {
+		return
+	}
+	if n.lastApplied == 0 || n.lastApplied-n.snapshotIndex < snapshotThreshold {
+		return
+	}
+
+	snapshot := n.stateMachine.Snapshot()
+	lastTerm := n.raftLog.TermAt(n.lastApplied)
+	if err := n.snapshotStore.SaveSnapshot(uint64(n.lastApplied), uint64(lastTerm), snapshot); err != nil {
+		log.Printf("[RaftNode] ERROR: failed to save snapshot: %v", err)
+		return
+	}
+
+	if err := n.wal.DiscardBeforeIndex(uint64(n.lastApplied + 1)); err != nil {
+		log.Printf("[RaftNode] ERROR: failed to discard old WAL entries after snapshot: %v", err)
+		return
+	}
+
+	// Update log base to reflect compaction
+	n.raftLog.SetBaseIndex(n.lastApplied, lastTerm)
+
+	n.snapshotIndex = n.lastApplied
+	log.Printf("[RaftNode] Saved snapshot through index %d", n.snapshotIndex)
 }
 
 // startHeartbeatTickerLocked starts sending periodic heartbeats.

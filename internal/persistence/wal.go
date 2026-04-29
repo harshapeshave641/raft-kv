@@ -123,73 +123,87 @@ func (w *WAL) ReadAll() ([][]byte, error) {
 }
 
 // TruncateFromIndex rewrites the WAL keeping only records with an Index strictly less than the given index.
-// Used when a follower detects conflicting entries from the leader.
+// Used when a follower detects conflicting entries from the leader (Truncate After).
 func (w *WAL) TruncateFromIndex(index uint64) error {
-    w.mu.Lock()
-    defer w.mu.Unlock()
+	return w.filterLocked(func(entryIndex uint64) bool {
+		return entryIndex < index
+	})
+}
 
-    all, err := w.readAllLocked()
-    if err != nil {
-        return err
-    }
+// DiscardBeforeIndex rewrites the WAL keeping only records with an Index greater than or equal to the given index.
+// Used for log compaction after a snapshot (Truncate Before).
+func (w *WAL) DiscardBeforeIndex(index uint64) error {
+	return w.filterLocked(func(entryIndex uint64) bool {
+		return entryIndex >= index
+	})
+}
 
-    var keep [][]byte
-    for _, record := range all {
-        var entry struct {
-            Index uint64 `json:"Index"`
-        }
-        if err := json.Unmarshal(record, &entry); err != nil {
-            return err // corrupted JSON
-        }
-        if entry.Index >= index {
-            break // discard this and all following
-        }
-        keep = append(keep, record)
-    }
+func (w *WAL) filterLocked(keepFn func(uint64) bool) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
-    if len(keep) == len(all) {
-        return nil // nothing to do
-    }
+	all, err := w.readAllLocked()
+	if err != nil {
+		return err
+	}
 
-    // Write to temp file
-    tmpPath := filepath.Join(w.dataDir, "wal.tmp")
-    tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-    if err != nil {
-        return err
-    }
+	var keep [][]byte
+	for _, record := range all {
+		var entry struct {
+			Index uint64 `json:"Index"`
+		}
+		if err := json.Unmarshal(record, &entry); err != nil {
+			return err // corrupted JSON
+		}
+		if keepFn(entry.Index) {
+			keep = append(keep, record)
+		}
+	}
 
-    for _, record := range keep {
-        checksum := crc32.ChecksumIEEE(record)
-        var header [8]byte
-        binary.BigEndian.PutUint32(header[0:4], walMagic)
-        binary.BigEndian.PutUint32(header[4:8], uint32(len(record)))
-        var footer [4]byte
-        binary.BigEndian.PutUint32(footer[0:4], checksum)
+	if len(keep) == len(all) {
+		return nil // nothing to do
+	}
 
-        tmp.Write(header[:])
-        tmp.Write(record)
-        tmp.Write(footer[:])
-    }
+	// Write to temp file
+	tmpPath := filepath.Join(w.dataDir, "wal.tmp")
+	tmp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return err
+	}
 
-    if err := tmp.Sync(); err != nil {
-        tmp.Close()
-        os.Remove(tmpPath)
-        return err
-    }
-    tmp.Close()
+	for _, record := range keep {
+		checksum := crc32.ChecksumIEEE(record)
+		var header [8]byte
+		binary.BigEndian.PutUint32(header[0:4], walMagic)
+		binary.BigEndian.PutUint32(header[4:8], uint32(len(record)))
+		var footer [4]byte
+		binary.BigEndian.PutUint32(footer[0:4], checksum)
 
-    // Close original file before renaming on Windows
-    w.file.Close()
+		tmp.Write(header[:])
+		tmp.Write(record)
+		tmp.Write(footer[:])
+	}
 
-    // Atomic rename
-    walPath := filepath.Join(w.dataDir, "wal.log")
-    if err := os.Rename(tmpPath, walPath); err != nil {
-        return err
-    }
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	tmp.Close()
 
-    // Reopen file handle
-    w.file, err = os.OpenFile(walPath, os.O_RDWR|os.O_APPEND, 0644)
-    return err
+	// Close original file before renaming on Windows
+	w.file.Close()
+
+	// Atomic rename
+	walPath := filepath.Join(w.dataDir, "wal.log")
+	if err := os.Rename(tmpPath, walPath); err != nil {
+		return err
+	}
+
+	// Reopen file handle
+	var openErr error
+	w.file, openErr = os.OpenFile(walPath, os.O_RDWR|os.O_APPEND, 0644)
+	return openErr
 }
 
 func (w *WAL) Close() error {

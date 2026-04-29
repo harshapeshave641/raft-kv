@@ -39,19 +39,43 @@ func main() {
 		log.Fatalf("Failed to initialize StateStore: %v", err)
 	}
 
-	// Recover from WAL
+	// Initialize SnapshotStore
+	snapshotStore, err := persistence.NewSnapshotStore(*dataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize SnapshotStore: %v", err)
+	}
+
+	// Recover from snapshot and WAL
+	raftLog := raft.NewRaftLog()
+	var lastApplied raft.Index = 0
+
+	log.Printf("Recovering from snapshot...")
+	snapshot, err := snapshotStore.LoadSnapshot()
+	if err != nil {
+		log.Fatalf("Failed to load snapshot: %v", err)
+	}
+
+	if snapshot != nil {
+		sm.Restore(snapshot.Data)
+		lastApplied = raft.Index(snapshot.LastIncludedIndex)
+		raftLog.SetBaseIndex(lastApplied, raft.Term(snapshot.LastIncludedTerm))
+		log.Printf("Loaded snapshot through index %d term %d", snapshot.LastIncludedIndex, snapshot.LastIncludedTerm)
+	}
+
 	log.Printf("Recovering from WAL...")
 	records, err := wal.ReadAll()
 	if err != nil {
 		log.Fatalf("Failed to read WAL entries: %v", err)
 	}
 
-	raftLog := raft.NewRaftLog()
 	var entries []raft.LogEntry
 	for _, record := range records {
 		var entry raft.LogEntry
 		if err := json.Unmarshal(record, &entry); err != nil {
 			log.Fatalf("Failed to unmarshal log entry: %v", err)
+		}
+		if entry.Index <= lastApplied {
+			continue
 		}
 		entries = append(entries, entry)
 	}
@@ -59,7 +83,6 @@ func main() {
 	log.Printf("Recovered %d entries into RaftLog. Last index: %d", len(entries), raftLog.LastIndex())
 
 	// Replay committed entries into State Machine
-	var lastApplied raft.Index = 0
 	// For now, we assume everything in the WAL was committed on restart.
 	// In a full Raft implementation, this would be drive by the persistent commitIndex or Snapshot.
 	for _, entry := range entries {
@@ -118,7 +141,7 @@ func main() {
 	transport := rpc.NewHTTPTransport()
 
 	// Initialize the orchestrator
-	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, sm, transport, lastApplied)
+	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, snapshotStore, sm, transport, lastApplied)
 	if err != nil {
 		log.Fatalf("Failed to initialize RaftNode: %v", err)
 	}
