@@ -226,8 +226,8 @@ func (n *RaftNode) maybeCreateSnapshotLocked() {
 		return
 	}
 
-	if err := n.wal.TruncateFromIndex(uint64(n.lastApplied + 1)); err != nil {
-		log.Printf("[RaftNode] ERROR: failed to truncate WAL after snapshot: %v", err)
+	if err := n.wal.DiscardBeforeIndex(uint64(n.lastApplied + 1)); err != nil {
+		log.Printf("[RaftNode] ERROR: failed to discard old WAL entries after snapshot: %v", err)
 		return
 	}
 
