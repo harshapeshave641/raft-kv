@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"os"
 
 	"raftkv/internal/api"
 	"raftkv/internal/persistence"
@@ -22,6 +23,13 @@ func main() {
 	dataDir := flag.String("data", "data", "Data directory")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peers (e.g. node2=localhost:3002,node3=localhost:3003)")
 	flag.Parse()
+	
+	// Override port if PORT environment variable is set
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		if p, err := strconv.Atoi(envPort); err == nil {
+			*port = p
+		}
+	}
 
 	// Initialize the Phase 1 state machine
 	sm := store.NewStateMachine()
