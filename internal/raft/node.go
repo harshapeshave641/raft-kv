@@ -9,6 +9,7 @@ import (
 
 	"raftkv/internal/persistence"
 	"raftkv/internal/store"
+	"raftkv/internal/telemetry"
 )
 
 const snapshotThreshold = 200
@@ -26,6 +27,7 @@ type RaftNode struct {
 	snapshotStore *persistence.SnapshotStore
 	lastApplied   Index
 	snapshotIndex Index
+	tracer        *telemetry.Tracer
 
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
@@ -44,6 +46,7 @@ func NewRaftNode(
 	stateMachine *store.StateMachine,
 	transport Transport,
 	lastApplied Index,
+	tracer *telemetry.Tracer,
 ) (*RaftNode, error) {
 	// Load persisted state (if any)
 	term, votedFor, err := stateStore.Load()
@@ -63,11 +66,12 @@ func NewRaftNode(
 		stateStore:    stateStore,
 		wal:           wal,
 		raftLog:       raftLog,
-		stateMachine: stateMachine,
+		stateMachine:  stateMachine,
 		transport:     transport,
 		snapshotStore: snapshotStore,
 		lastApplied:   lastApplied,
 		snapshotIndex: lastApplied,
+		tracer:        tracer,
 		stopChan:      make(chan struct{}),
 	}, nil
 }
@@ -85,6 +89,9 @@ func (n *RaftNode) Stop() {
 	close(n.stopChan)
 	if n.electionTimer != nil {
 		n.electionTimer.Stop()
+	}
+	if n.tracer != nil {
+		n.tracer.Close()
 	}
 }
 
@@ -127,6 +134,7 @@ func (n *RaftNode) executeActions(actions []Action) {
 			if err := n.stateStore.Save(uint64(action.State.CurrentTerm), string(action.State.VotedFor)); err != nil {
 				log.Printf("[RaftNode] ERROR: Failed to persist state: %v", err)
 			}
+			n.tracer.Record(telemetry.EventTermChange, uint64(action.State.CurrentTerm), 0, map[string]interface{}{"voted_for": action.State.VotedFor})
 		
 		case ActionAppendLog:
 			if action.TruncateIndex > 0 {
@@ -135,6 +143,7 @@ func (n *RaftNode) executeActions(actions []Action) {
 					log.Printf("[RaftNode] ERROR: WAL TruncateFromIndex failed: %v", err)
 				}
 				n.raftLog.TruncateFrom(action.TruncateIndex)
+				n.tracer.Record(telemetry.EventTruncateLog, uint64(n.core.CurrentTerm()), uint64(action.TruncateIndex), nil)
 			}
 			if len(action.LogEntries) > 0 {
 				log.Printf("[RaftNode] Writing %d entries to WAL", len(action.LogEntries))
@@ -151,6 +160,9 @@ func (n *RaftNode) executeActions(actions []Action) {
 			}
 			if len(action.LogEntries) > 0 {
 				n.raftLog.Append(action.LogEntries)
+				for _, entry := range action.LogEntries {
+					n.tracer.Record(telemetry.EventAppendLog, uint64(entry.Term), uint64(entry.Index), nil)
+				}
 			}
 
 		case ActionCommit:
@@ -165,6 +177,7 @@ func (n *RaftNode) executeActions(actions []Action) {
 					}
 					n.stateMachine.Apply(cmd)
 					log.Printf("[RaftNode] APPLIED command at index %d: %+v", n.lastApplied, cmd)
+					n.tracer.Record(telemetry.EventCommit, uint64(entry.Term), uint64(n.lastApplied), map[string]interface{}{"command": cmd})
 				}
 			}
 			n.maybeCreateSnapshotLocked()
@@ -185,6 +198,12 @@ func (n *RaftNode) executeActions(actions []Action) {
 					log.Printf("[RaftNode] Failed to send RequestVote to %s: %v", peerID, err)
 					return
 				}
+				n.tracer.Record(telemetry.EventRPCSent, uint64(args.Term), 0, map[string]interface{}{
+					"to":           peerID,
+					"rpc":          "RequestVote",
+					"lastLogIndex": args.LastLogIndex,
+					"lastLogTerm":  args.LastLogTerm,
+				})
 				n.HandleRequestVoteResponse(peerID, reply)
 			}(action.To, peerAddress, *action.RequestVoteArgs)
 		
@@ -200,11 +219,19 @@ func (n *RaftNode) executeActions(actions []Action) {
 					// Also don't spam errors for missing heartbeats
 					return
 				}
+				n.tracer.Record(telemetry.EventRPCSent, uint64(args.Term), 0, map[string]interface{}{
+					"to":           peerID,
+					"rpc":          "AppendEntries",
+					"entriesCount": len(args.Entries),
+					"prevLogIndex": args.PrevLogIndex,
+					"prevLogTerm":  args.PrevLogTerm,
+				})
 				n.HandleAppendEntriesResponse(peerID, reply, args)
 			}(action.To, peerAddress, *action.AppendEntriesArgs)
 
 		case ActionBecomeLeader:
 			log.Printf("[RaftNode] Elected LEADER for term %d!", action.Term)
+			n.tracer.Record(telemetry.EventBecomeLeader, uint64(action.Term), uint64(n.raftLog.LastIndex()), nil)
 			n.core.SetLeader()
 			n.startHeartbeatTickerLocked()
 		}
@@ -236,6 +263,7 @@ func (n *RaftNode) maybeCreateSnapshotLocked() {
 
 	n.snapshotIndex = n.lastApplied
 	log.Printf("[RaftNode] Saved snapshot through index %d", n.snapshotIndex)
+	n.tracer.Record(telemetry.EventSnapshot, uint64(lastTerm), uint64(n.lastApplied), nil)
 }
 
 // startHeartbeatTickerLocked starts sending periodic heartbeats.
@@ -299,6 +327,7 @@ func (n *RaftNode) resetElectionTimerLocked() {
 		}
 
 		log.Printf("[RaftNode] Election timeout reached. Triggering new election.")
+		n.tracer.Record(telemetry.EventElectionStart, uint64(n.core.CurrentTerm()+1), 0, nil)
 		actions := n.core.HandleElectionTimeout()
 		n.executeActions(actions)
 	})
@@ -312,6 +341,13 @@ func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
 	defer n.mu.Unlock()
 
 	reply, actions := n.core.HandleRequestVoteRequest(args)
+	n.tracer.Record(telemetry.EventRPCReceived, uint64(args.Term), 0, map[string]interface{}{
+		"from":         args.CandidateID,
+		"rpc":          "RequestVote",
+		"granted":      reply.VoteGranted,
+		"lastLogIndex": args.LastLogIndex,
+		"lastLogTerm":  args.LastLogTerm,
+	})
 	n.executeActions(actions)
 	return reply
 }
@@ -322,6 +358,11 @@ func (n *RaftNode) HandleRequestVoteResponse(peer NodeID, reply RequestVoteReply
 	defer n.mu.Unlock()
 
 	log.Printf("[RaftNode] Received RequestVoteResponse from %s: Granted=%v, Term=%d", peer, reply.VoteGranted, reply.Term)
+	n.tracer.Record(telemetry.EventRPCReceived, uint64(reply.Term), 0, map[string]interface{}{
+		"from":    peer,
+		"rpc":     "RequestVoteResponse",
+		"granted": reply.VoteGranted,
+	})
 	actions := n.core.HandleRequestVoteResponse(peer, reply)
 	n.executeActions(actions)
 }
@@ -332,6 +373,14 @@ func (n *RaftNode) HandleAppendEntriesRequest(args AppendEntriesArgs) AppendEntr
 	defer n.mu.Unlock()
 
 	reply, actions := n.core.HandleAppendEntriesRequest(args)
+	n.tracer.Record(telemetry.EventRPCReceived, uint64(args.Term), 0, map[string]interface{}{
+		"from":         args.LeaderID,
+		"rpc":          "AppendEntries",
+		"success":      reply.Success,
+		"entriesCount": len(args.Entries),
+		"prevLogIndex": args.PrevLogIndex,
+		"prevLogTerm":  args.PrevLogTerm,
+	})
 	n.executeActions(actions)
 	return reply
 }
@@ -344,6 +393,11 @@ func (n *RaftNode) HandleAppendEntriesResponse(peer NodeID, reply AppendEntriesR
 	if len(args.Entries) > 0 {
 		log.Printf("[RaftNode] Received AppendEntriesResponse from %s: Success=%v, Term=%d", peer, reply.Success, reply.Term)
 	}
+	n.tracer.Record(telemetry.EventRPCReceived, uint64(reply.Term), 0, map[string]interface{}{
+		"from":    peer,
+		"rpc":     "AppendEntriesResponse",
+		"success": reply.Success,
+	})
 	actions := n.core.HandleAppendEntriesResponse(peer, reply, args)
 	n.executeActions(actions)
 }

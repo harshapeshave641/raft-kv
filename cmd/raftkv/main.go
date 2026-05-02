@@ -6,15 +6,18 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"os/signal"
 	"strconv"
 	"strings"
-	"os"
+	"syscall"
 
 	"raftkv/internal/api"
 	"raftkv/internal/persistence"
 	"raftkv/internal/raft"
 	"raftkv/internal/rpc"
 	"raftkv/internal/store"
+	"raftkv/internal/telemetry"
 )
 
 func main() {
@@ -22,6 +25,9 @@ func main() {
 	port := flag.Int("port", 3001, "HTTP server port")
 	dataDir := flag.String("data", "data", "Data directory")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peers (e.g. node2=localhost:3002,node3=localhost:3003)")
+	neo4jURI := flag.String("neo4j", "bolt://localhost:7687", "Neo4j Bolt URI")
+	neo4jUser := flag.String("neo4j-user", "neo4j", "Neo4j Username")
+	neo4jPass := flag.String("neo4j-pass", "password", "Neo4j Password")
 	flag.Parse()
 	
 	// Override port if PORT environment variable is set
@@ -148,8 +154,14 @@ func main() {
 
 	transport := rpc.NewHTTPTransport()
 
+	// Initialize Tracer with Neo4j support
+	tracer, err := telemetry.NewTracer(*id, *neo4jURI, *neo4jUser, *neo4jPass)
+	if err != nil {
+		log.Printf("Warning: Failed to initialize tracer: %v", err)
+	}
+
 	// Initialize the orchestrator
-	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, snapshotStore, sm, transport, lastApplied)
+	raftNode, err := raft.NewRaftNode(config, raftLog, stateStore, wal, snapshotStore, sm, transport, lastApplied, tracer)
 	if err != nil {
 		log.Fatalf("Failed to initialize RaftNode: %v", err)
 	}
@@ -173,7 +185,20 @@ func main() {
 
 	addr := fmt.Sprintf(":%d", *port)
 	log.Printf("Starting RaftKV server on %s", addr)
-	if err := http.ListenAndServe(addr, mux); err != nil {
+
+	server := &http.Server{Addr: addr, Handler: mux}
+
+	// Handle graceful shutdown
+	go func() {
+		sigChan := make(chan os.Signal, 1)
+		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+		<-sigChan
+		log.Printf("Shutting down...")
+		raftNode.Stop()
+		server.Close()
+	}()
+
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
