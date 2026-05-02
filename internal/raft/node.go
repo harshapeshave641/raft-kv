@@ -10,6 +10,7 @@ import (
 	"raftkv/internal/persistence"
 	"raftkv/internal/store"
 	"raftkv/internal/telemetry"
+	"github.com/google/uuid"
 )
 
 const snapshotThreshold = 200
@@ -34,6 +35,10 @@ type RaftNode struct {
 	stopChan        chan struct{}
 
 	lastTimerResetLog time.Time // To throttle noise
+	
+	// Tracking for telemetry
+	prevState NodeState
+	prevTerm  Term
 }
 
 // NewRaftNode creates a new RaftNode orchestrator.
@@ -73,26 +78,9 @@ func NewRaftNode(
 		snapshotIndex: lastApplied,
 		tracer:        tracer,
 		stopChan:      make(chan struct{}),
+		prevState:     Follower,
+		prevTerm:      Term(term),
 	}, nil
-}
-
-// Start begins the background event loops (like the election timer).
-func (n *RaftNode) Start() {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	n.resetElectionTimerLocked()
-}
-
-// Stop shuts down the node.
-func (n *RaftNode) Stop() {
-	close(n.stopChan)
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
-	}
-	if n.tracer != nil {
-		n.tracer.Close()
-	}
 }
 
 // State returns the current volatile state of the node (safe for concurrent use).
@@ -123,14 +111,47 @@ func (n *RaftNode) CommitIndex() Index {
 	return n.core.commitIndex
 }
 
+// Start begins the background event loops (like the election timer).
+func (n *RaftNode) Start() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	n.resetElectionTimerLocked()
+}
+
+// Stop shuts down the node.
+func (n *RaftNode) Stop() {
+	close(n.stopChan)
+	if n.electionTimer != nil {
+		n.electionTimer.Stop()
+	}
+	if n.tracer != nil {
+		n.tracer.Close()
+	}
+}
+
 // executeActions runs the physical side effects returned by the pure RaftCore.
 // Must be called with n.mu held.
 func (n *RaftNode) executeActions(actions []Action) {
+	// Detect and log state transitions
+	currState := n.core.State()
+	currTerm := n.core.CurrentTerm()
+
+	if currState != n.prevState {
+		n.tracer.Record(telemetry.EventStateTransition, uint64(currTerm), 0, map[string]interface{}{
+			"from": n.prevState.String(),
+			"to":   currState.String(),
+		})
+		n.prevState = currState
+	}
+	if currTerm > n.prevTerm {
+		n.prevTerm = currTerm
+		// Handled by ActionPersistState mostly, but we ensure it's tracked
+	}
+
 	for _, action := range actions {
 		switch action.Type {
 		case ActionPersistState:
-			log.Printf("[RaftNode] Persisting state: Term=%d, VotedFor=%s", action.State.CurrentTerm, action.State.VotedFor)
-			// Write CurrentTerm and VotedFor to state.json
 			if err := n.stateStore.Save(uint64(action.State.CurrentTerm), string(action.State.VotedFor)); err != nil {
 				log.Printf("[RaftNode] ERROR: Failed to persist state: %v", err)
 			}
@@ -138,25 +159,15 @@ func (n *RaftNode) executeActions(actions []Action) {
 		
 		case ActionAppendLog:
 			if action.TruncateIndex > 0 {
-				log.Printf("[RaftNode] Truncating log from index %d", action.TruncateIndex)
 				if err := n.wal.TruncateFromIndex(uint64(action.TruncateIndex)); err != nil {
 					log.Printf("[RaftNode] ERROR: WAL TruncateFromIndex failed: %v", err)
 				}
 				n.raftLog.TruncateFrom(action.TruncateIndex)
 				n.tracer.Record(telemetry.EventTruncateLog, uint64(n.core.CurrentTerm()), uint64(action.TruncateIndex), nil)
 			}
-			if len(action.LogEntries) > 0 {
-				log.Printf("[RaftNode] Writing %d entries to WAL", len(action.LogEntries))
-			}
 			for _, entry := range action.LogEntries {
-				data, err := json.Marshal(entry)
-				if err != nil {
-					log.Printf("[RaftNode] ERROR: Failed to marshal LogEntry: %v", err)
-					continue
-				}
-				if err := n.wal.Append(data); err != nil {
-					log.Printf("[RaftNode] ERROR: WAL Append failed: %v", err)
-				}
+				data, _ := json.Marshal(entry)
+				n.wal.Append(data)
 			}
 			if len(action.LogEntries) > 0 {
 				n.raftLog.Append(action.LogEntries)
@@ -171,66 +182,59 @@ func (n *RaftNode) executeActions(actions []Action) {
 				entry, ok := n.raftLog.GetEntry(n.lastApplied)
 				if ok {
 					var cmd store.Command
-					if err := json.Unmarshal(entry.Command, &cmd); err != nil {
-						log.Printf("[RaftNode] ERROR: Failed to unmarshal command at index %d: %v", n.lastApplied, err)
-						continue
-					}
+					json.Unmarshal(entry.Command, &cmd)
 					n.stateMachine.Apply(cmd)
-					log.Printf("[RaftNode] APPLIED command at index %d: %+v", n.lastApplied, cmd)
 					n.tracer.Record(telemetry.EventCommit, uint64(entry.Term), uint64(n.lastApplied), map[string]interface{}{"command": cmd})
 				}
 			}
 			n.maybeCreateSnapshotLocked()
 
 		case ActionResetElectionTimer:
-			if time.Since(n.lastTimerResetLog) > 5*time.Second {
-				log.Printf("[RaftNode] Resetting election timer (throttled)...")
-				n.lastTimerResetLog = time.Now()
-			}
 			n.resetElectionTimerLocked()
 
 		case ActionSendRequestVote:
 			peerAddress := n.core.config.GetPeerAddress(action.To)
-			go func(peerID NodeID, addr string, args RequestVoteArgs) {
-				log.Printf("[RaftNode] Sending RequestVote to %s at %s for Term %d", peerID, addr, args.Term)
+			traceID := uuid.New().String()
+			go func(peerID NodeID, addr string, args RequestVoteArgs, tid string) {
+				start := time.Now()
+				n.tracer.Record(telemetry.EventRPCSent, uint64(args.Term), 0, map[string]interface{}{
+					"to": peerID, "rpc": "RequestVote", "trace_id": tid,
+				})
 				reply, err := n.transport.SendRequestVote(peerID, addr, args)
+				latency := time.Since(start).Milliseconds()
 				if err != nil {
-					log.Printf("[RaftNode] Failed to send RequestVote to %s: %v", peerID, err)
 					return
 				}
-				n.tracer.Record(telemetry.EventRPCSent, uint64(args.Term), 0, map[string]interface{}{
-					"to":           peerID,
-					"rpc":          "RequestVote",
-					"lastLogIndex": args.LastLogIndex,
-					"lastLogTerm":  args.LastLogTerm,
+				n.tracer.Record(telemetry.EventRPCReceived, uint64(reply.Term), 0, map[string]interface{}{
+					"from": peerID, "rpc": "RequestVoteResponse", "granted": reply.VoteGranted, "latency_ms": latency, "trace_id": tid,
 				})
 				n.HandleRequestVoteResponse(peerID, reply)
-			}(action.To, peerAddress, *action.RequestVoteArgs)
+			}(action.To, peerAddress, *action.RequestVoteArgs, traceID)
 		
 		case ActionSendAppendEntries:
 			peerAddress := n.core.config.GetPeerAddress(action.To)
-			go func(peerID NodeID, addr string, args AppendEntriesArgs) {
-				// Don't log heartbeats to avoid spam
-				if len(args.Entries) > 0 {
-					log.Printf("[RaftNode] Sending AppendEntries to %s at %s with %d entries", peerID, addr, len(args.Entries))
-				}
-				reply, err := n.transport.SendAppendEntries(peerID, addr, args)
-				if err != nil {
-					// Also don't spam errors for missing heartbeats
-					return
+			traceID := uuid.New().String()
+			go func(peerID NodeID, addr string, args AppendEntriesArgs, tid string) {
+				start := time.Now()
+				rpcType := "AppendEntries"
+				if len(args.Entries) == 0 {
+					rpcType = "Heartbeat"
 				}
 				n.tracer.Record(telemetry.EventRPCSent, uint64(args.Term), 0, map[string]interface{}{
-					"to":           peerID,
-					"rpc":          "AppendEntries",
-					"entriesCount": len(args.Entries),
-					"prevLogIndex": args.PrevLogIndex,
-					"prevLogTerm":  args.PrevLogTerm,
+					"to": peerID, "rpc": rpcType, "trace_id": tid,
+				})
+				reply, err := n.transport.SendAppendEntries(peerID, addr, args)
+				latency := time.Since(start).Milliseconds()
+				if err != nil {
+					return
+				}
+				n.tracer.Record(telemetry.EventRPCReceived, uint64(reply.Term), 0, map[string]interface{}{
+					"from": peerID, "rpc": rpcType + "Response", "success": reply.Success, "latency_ms": latency, "trace_id": tid,
 				})
 				n.HandleAppendEntriesResponse(peerID, reply, args)
-			}(action.To, peerAddress, *action.AppendEntriesArgs)
+			}(action.To, peerAddress, *action.AppendEntriesArgs, traceID)
 
 		case ActionBecomeLeader:
-			log.Printf("[RaftNode] Elected LEADER for term %d!", action.Term)
 			n.tracer.Record(telemetry.EventBecomeLeader, uint64(action.Term), uint64(n.raftLog.LastIndex()), nil)
 			n.core.SetLeader()
 			n.startHeartbeatTickerLocked()
@@ -239,43 +243,21 @@ func (n *RaftNode) executeActions(actions []Action) {
 }
 
 func (n *RaftNode) maybeCreateSnapshotLocked() {
-	if n.snapshotStore == nil {
+	if n.snapshotStore == nil || n.lastApplied == 0 || n.lastApplied-n.snapshotIndex < snapshotThreshold {
 		return
 	}
-	if n.lastApplied == 0 || n.lastApplied-n.snapshotIndex < snapshotThreshold {
-		return
-	}
-
 	snapshot := n.stateMachine.Snapshot()
 	lastTerm := n.raftLog.TermAt(n.lastApplied)
-	if err := n.snapshotStore.SaveSnapshot(uint64(n.lastApplied), uint64(lastTerm), snapshot); err != nil {
-		log.Printf("[RaftNode] ERROR: failed to save snapshot: %v", err)
-		return
-	}
-
-	if err := n.wal.DiscardBeforeIndex(uint64(n.lastApplied + 1)); err != nil {
-		log.Printf("[RaftNode] ERROR: failed to discard old WAL entries after snapshot: %v", err)
-		return
-	}
-
-	// Update log base to reflect compaction
+	n.snapshotStore.SaveSnapshot(uint64(n.lastApplied), uint64(lastTerm), snapshot)
+	n.wal.DiscardBeforeIndex(uint64(n.lastApplied + 1))
 	n.raftLog.SetBaseIndex(n.lastApplied, lastTerm)
-
 	n.snapshotIndex = n.lastApplied
-	log.Printf("[RaftNode] Saved snapshot through index %d", n.snapshotIndex)
 	n.tracer.Record(telemetry.EventSnapshot, uint64(lastTerm), uint64(n.lastApplied), nil)
 }
 
-// startHeartbeatTickerLocked starts sending periodic heartbeats.
 func (n *RaftNode) startHeartbeatTickerLocked() {
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
-	}
-	if n.heartbeatTicker != nil {
-		n.heartbeatTicker.Stop()
-	}
-
-	// Send initial heartbeat immediately
+	if n.electionTimer != nil { n.electionTimer.Stop() }
+	if n.heartbeatTicker != nil { n.heartbeatTicker.Stop() }
 	actions := n.core.HandleHeartbeatTick()
 	n.executeActions(actions)
 
@@ -293,9 +275,7 @@ func (n *RaftNode) startHeartbeatTickerLocked() {
 					actions := n.core.HandleHeartbeatTick()
 					n.executeActions(actions)
 				} else {
-					t.Stop()
-					n.mu.Unlock()
-					return // stop if we stepped down or a new ticker started
+					t.Stop(); n.mu.Unlock(); return
 				}
 				n.mu.Unlock()
 			}
@@ -303,111 +283,68 @@ func (n *RaftNode) startHeartbeatTickerLocked() {
 	}(ticker)
 }
 
-// resetElectionTimerLocked sets a new randomized timeout (150-300ms).
 func (n *RaftNode) resetElectionTimerLocked() {
-	if n.electionTimer != nil {
-		n.electionTimer.Stop()
-	}
-	if n.heartbeatTicker != nil {
-		n.heartbeatTicker.Stop()
-		n.heartbeatTicker = nil
-	}
-
-	// Randomized timeout between 150ms and 300ms
+	if n.electionTimer != nil { n.electionTimer.Stop() }
+	if n.heartbeatTicker != nil { n.heartbeatTicker.Stop(); n.heartbeatTicker = nil }
 	timeout := time.Duration(150+rand.Intn(150)) * time.Millisecond
-
 	n.electionTimer = time.AfterFunc(timeout, func() {
-		n.mu.Lock()
-		defer n.mu.Unlock()
-
+		n.mu.Lock(); defer n.mu.Unlock()
 		select {
-		case <-n.stopChan:
-			return
+		case <-n.stopChan: return
 		default:
 		}
-
-		log.Printf("[RaftNode] Election timeout reached. Triggering new election.")
-		n.tracer.Record(telemetry.EventElectionStart, uint64(n.core.CurrentTerm()+1), 0, nil)
+		n.tracer.Record(telemetry.EventElectionTimeout, uint64(n.core.CurrentTerm()), 0, nil)
 		actions := n.core.HandleElectionTimeout()
 		n.executeActions(actions)
 	})
 }
 
-// --- Thread-Safe RPC Handlers ---
-
-// HandleRequestVote safely delegates an incoming RPC to the core state machine.
 func (n *RaftNode) HandleRequestVote(args RequestVoteArgs) RequestVoteReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	n.mu.Lock(); defer n.mu.Unlock()
 	reply, actions := n.core.HandleRequestVoteRequest(args)
 	n.tracer.Record(telemetry.EventRPCReceived, uint64(args.Term), 0, map[string]interface{}{
-		"from":         args.CandidateID,
-		"rpc":          "RequestVote",
-		"granted":      reply.VoteGranted,
-		"lastLogIndex": args.LastLogIndex,
-		"lastLogTerm":  args.LastLogTerm,
+		"from": args.CandidateID, "rpc": "RequestVote", "granted": reply.VoteGranted,
 	})
 	n.executeActions(actions)
 	return reply
 }
 
-// HandleRequestVoteResponse safely delegates an RPC reply to the core state machine.
 func (n *RaftNode) HandleRequestVoteResponse(peer NodeID, reply RequestVoteReply) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	log.Printf("[RaftNode] Received RequestVoteResponse from %s: Granted=%v, Term=%d", peer, reply.VoteGranted, reply.Term)
-	n.tracer.Record(telemetry.EventRPCReceived, uint64(reply.Term), 0, map[string]interface{}{
-		"from":    peer,
-		"rpc":     "RequestVoteResponse",
-		"granted": reply.VoteGranted,
-	})
+	n.mu.Lock(); defer n.mu.Unlock()
 	actions := n.core.HandleRequestVoteResponse(peer, reply)
 	n.executeActions(actions)
 }
 
-// HandleAppendEntriesRequest safely delegates an incoming RPC to the core.
 func (n *RaftNode) HandleAppendEntriesRequest(args AppendEntriesArgs) AppendEntriesReply {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	n.mu.Lock(); defer n.mu.Unlock()
 	reply, actions := n.core.HandleAppendEntriesRequest(args)
+	rpcType := "AppendEntries"
+	if len(args.Entries) == 0 { rpcType = "Heartbeat" }
 	n.tracer.Record(telemetry.EventRPCReceived, uint64(args.Term), 0, map[string]interface{}{
-		"from":         args.LeaderID,
-		"rpc":          "AppendEntries",
-		"success":      reply.Success,
-		"entriesCount": len(args.Entries),
-		"prevLogIndex": args.PrevLogIndex,
-		"prevLogTerm":  args.PrevLogTerm,
+		"from": args.LeaderID, "rpc": rpcType, "success": reply.Success,
 	})
 	n.executeActions(actions)
 	return reply
 }
 
-// HandleAppendEntriesResponse safely delegates an RPC reply to the core.
 func (n *RaftNode) HandleAppendEntriesResponse(peer NodeID, reply AppendEntriesReply, args AppendEntriesArgs) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if len(args.Entries) > 0 {
-		log.Printf("[RaftNode] Received AppendEntriesResponse from %s: Success=%v, Term=%d", peer, reply.Success, reply.Term)
-	}
-	n.tracer.Record(telemetry.EventRPCReceived, uint64(reply.Term), 0, map[string]interface{}{
-		"from":    peer,
-		"rpc":     "AppendEntriesResponse",
-		"success": reply.Success,
-	})
+	n.mu.Lock(); defer n.mu.Unlock()
 	actions := n.core.HandleAppendEntriesResponse(peer, reply, args)
 	n.executeActions(actions)
 }
 
-// ProposeCommand safely submits a command to the pure state machine if leader.
 func (n *RaftNode) ProposeCommand(cmd []byte) (Index, Term) {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
+	n.mu.Lock(); defer n.mu.Unlock()
 	idx, term, actions := n.core.ProposeCommand(cmd)
 	n.executeActions(actions)
 	return idx, term
+}
+
+func (s NodeState) String() string {
+	switch s {
+	case Follower: return "Follower"
+	case Candidate: return "Candidate"
+	case Leader: return "Leader"
+	default: return "Unknown"
+	}
 }

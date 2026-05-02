@@ -7,33 +7,44 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
 )
 
 type EventType string
 
 const (
-	EventStateTransition EventType = "StateTransition"
-	EventTermChange      EventType = "TermChange"
-	EventElectionStart   EventType = "ElectionStart"
-	EventVoteReceived    EventType = "VoteReceived"
-	EventVoteGranted     EventType = "VoteGranted"
-	EventBecomeLeader    EventType = "BecomeLeader"
-	EventAppendLog       EventType = "AppendLog"
-	EventTruncateLog     EventType = "TruncateLog"
-	EventCommit          EventType = "Commit"
-	EventRPCSent         EventType = "RPCSent"
-	EventRPCReceived     EventType = "RPCReceived"
-	EventSnapshot        EventType = "Snapshot"
+	EventStateTransition      EventType = "StateTransition"
+	EventTermChange           EventType = "TermChange"
+	EventElectionStart        EventType = "ElectionStart"
+	EventVoteReceived         EventType = "VoteReceived"
+	EventVoteGranted          EventType = "VoteGranted"
+	EventBecomeLeader         EventType = "BecomeLeader"
+	EventAppendLog            EventType = "AppendLog"
+	EventTruncateLog          EventType = "TruncateLog"
+	EventCommit               EventType = "Commit"
+	EventRPCSent              EventType = "RPCSent"
+	EventRPCReceived          EventType = "RPCReceived"
+	EventSnapshot             EventType = "Snapshot"
+	EventHeartbeat            EventType = "Heartbeat"
+	EventElectionTimeout      EventType = "ElectionTimeout"
+	EventAppendEntriesResponse EventType = "AppendEntriesResponse"
+	EventVoteRequest          EventType = "VoteRequest"
+	EventVoteResponse         EventType = "VoteResponse"
+	EventStepDown             EventType = "StepDown"
+	EventLeaderChange         EventType = "LeaderChange"
 )
 
 type Event struct {
-	Timestamp time.Time              `json:"timestamp"`
-	NodeID    string                 `json:"node_id"`
-	Type      EventType              `json:"type"`
-	Term      uint64                 `json:"term"`
-	Index     uint64                 `json:"index,omitempty"`
-	Details   map[string]interface{} `json:"details,omitempty"`
+	ID            string                 `json:"id"`
+	Timestamp     time.Time              `json:"timestamp"`
+	TimestampUnix int64                  `json:"timestamp_unix"`
+	NodeID        string                 `json:"node_id"`
+	Type          EventType              `json:"type"`
+	Term          uint64                 `json:"term"`
+	Index         uint64                 `json:"index,omitempty"`
+	TraceID       string                 `json:"trace_id,omitempty"`
+	Details       map[string]interface{} `json:"details,omitempty"`
 }
 
 type Tracer struct {
@@ -44,13 +55,19 @@ type Tracer struct {
 	driver   neo4j.DriverWithContext
 	eventCh  chan Event
 	stopChan chan struct{}
+
+	// Batching config
+	batchSize     int
+	flushInterval time.Duration
 }
 
 func NewTracer(nodeID string, neo4jURI, neo4jUser, neo4jPassword string) (*Tracer, error) {
 	t := &Tracer{
-		nodeID:   nodeID,
-		eventCh:  make(chan Event, 10000), // Large buffer for high traffic
-		stopChan: make(chan struct{}),
+		nodeID:        nodeID,
+		eventCh:       make(chan Event, 10000),
+		stopChan:      make(chan struct{}),
+		batchSize:     100,
+		flushInterval: 100 * time.Millisecond,
 	}
 
 	if neo4jURI != "" {
@@ -58,16 +75,15 @@ func NewTracer(nodeID string, neo4jURI, neo4jUser, neo4jPassword string) (*Trace
 		if err != nil {
 			log.Printf("[Tracer] Error: Failed to create Neo4j driver: %v", err)
 		} else {
-			// Verify connection
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			if err := driver.VerifyConnectivity(ctx); err != nil {
 				log.Printf("[Tracer] Error: Neo4j connectivity check failed: %v", err)
 				driver.Close(ctx)
 			} else {
-				log.Printf("[Tracer] Successfully connected to Neo4j")
+				log.Printf("[Tracer] Successfully connected to Neo4j (Batching Enabled)")
 				t.driver = driver
-				go t.neo4jWorker()
+				go t.batchWorker()
 			}
 		}
 	}
@@ -80,95 +96,137 @@ func (t *Tracer) Record(eventType EventType, term uint64, index uint64, details 
 		return
 	}
 
-	event := Event{
-		Timestamp: time.Now(),
-		NodeID:    t.nodeID,
-		Type:      eventType,
-		Term:      term,
-		Index:     index,
-		Details:   details,
+	// Extract or generate TraceID
+	traceID := ""
+	if tid, ok := details["trace_id"].(string); ok {
+		traceID = tid
+	} else {
+		traceID = uuid.New().String()
 	}
 
-	// Send to Neo4j worker (non-blocking)
+	event := Event{
+		ID:            uuid.New().String(),
+		Timestamp:     time.Now(),
+		TimestampUnix: time.Now().UnixMilli(),
+		NodeID:        t.nodeID,
+		Type:          eventType,
+		Term:          term,
+		Index:         index,
+		TraceID:       traceID,
+		Details:       details,
+	}
+
 	select {
 	case t.eventCh <- event:
 	default:
-		// Drop event if channel is full to protect Raft performance
 	}
 }
 
-func (t *Tracer) neo4jWorker() {
+func (t *Tracer) batchWorker() {
+	ticker := time.NewTicker(t.flushInterval)
+	defer ticker.Stop()
+
+	var batch []Event
 	ctx := context.Background()
-	log.Printf("[Tracer] Neo4j worker started for node %s", t.nodeID)
+
 	for {
 		select {
 		case <-t.stopChan:
-			log.Printf("[Tracer] Neo4j worker stopping...")
+			if len(batch) > 0 {
+				t.flushBatch(ctx, batch)
+			}
 			return
 		case event := <-t.eventCh:
-			err := t.writeToNeo4j(ctx, event)
-			if err != nil {
-				log.Printf("[Tracer] Neo4j write error: %v", err)
+			batch = append(batch, event)
+			if len(batch) >= t.batchSize {
+				t.flushBatch(ctx, batch)
+				batch = nil
+			}
+		case <-ticker.C:
+			if len(batch) > 0 {
+				t.flushBatch(ctx, batch)
+				batch = nil
 			}
 		}
 	}
 }
 
-func (t *Tracer) writeToNeo4j(ctx context.Context, e Event) error {
+func (t *Tracer) flushBatch(ctx context.Context, batch []Event) {
 	session := t.driver.NewSession(ctx, neo4j.SessionConfig{AccessMode: neo4j.AccessModeWrite})
 	defer session.Close(ctx)
 
 	_, err := session.ExecuteWrite(ctx, func(tx neo4j.ManagedTransaction) (interface{}, error) {
-		detailsJSON, _ := json.Marshal(e.Details)
-		detailsStr := string(detailsJSON)
-		
-		params := map[string]interface{}{
-			"id":      e.NodeID,
-			"term":    e.Term,
-			"idx":     e.Index,
-			"ts":      e.Timestamp.Format(time.RFC3339Nano),
-			"details": detailsStr,
-			"type":    string(e.Type),
-		}
+		for _, e := range batch {
+			detailsJSON, _ := json.Marshal(e.Details)
+			params := map[string]interface{}{
+				"id":      e.NodeID,
+				"eid":     e.ID,
+				"term":    e.Term,
+				"idx":     e.Index,
+				"ts":      e.Timestamp.Format(time.RFC3339Nano),
+				"ts_unix": e.TimestampUnix,
+				"type":    string(e.Type),
+				"tid":     e.TraceID,
+				"details": string(detailsJSON),
+			}
 
-		// Always ensure Server and Term exist
-		tx.Run(ctx, "MERGE (s:Server {id: $id})", params)
-		tx.Run(ctx, "MERGE (t:Term {value: $term})", params)
-		
-		// Record the event node itself for history
-		tx.Run(ctx, "MATCH (s:Server {id: $id}), (t:Term {value: $term}) CREATE (s)-[:LOGGED_EVENT {type: $type, timestamp: $ts, details: $details}]->(t)", params)
+			// 1. Create the Event Node (Normalized)
+			tx.Run(ctx, `
+				MERGE (s:Server {id: $id})
+				MERGE (t:Term {value: $term})
+				CREATE (e:Event {
+					id: $eid,
+					type: $type,
+					timestamp: $ts,
+					timestamp_unix: $ts_unix,
+					term: $term,
+					index: $idx,
+					trace_id: $tid,
+					details: $details
+				})
+				CREATE (s)-[:EMITTED]->(e)
+				CREATE (e)-[:IN_TERM]->(t)
+			`, params)
 
-		switch e.Type {
-		case EventTermChange:
-			tx.Run(ctx, "MATCH (s:Server {id: $id}), (t:Term {value: $term}) MERGE (s)-[r:IN_TERM]->(t) SET r.timestamp = $ts", params)
-			if v, ok := e.Details["voted_for"].(string); ok && v != "" {
-				params["voted_for"] = v
-				tx.Run(ctx, "MATCH (s:Server {id: $id}) MERGE (s2:Server {id: $voted_for}) MERGE (s)-[r:VOTED_FOR {term: $term}]->(s2) SET r.timestamp = $ts", params)
+			// 2. Optimized Current State Edges
+			switch e.Type {
+			case EventStateTransition:
+				if role, ok := e.Details["to"].(string); ok {
+					params["role"] = role
+					tx.Run(ctx, `
+						MATCH (s:Server {id: $id})
+						OPTIONAL MATCH (s)-[old:CURRENT_ROLE]->()
+						DELETE old
+						CREATE (s)-[:CURRENT_ROLE {role: $role, since: $ts}]->(:Role {name: $role})
+					`, params)
+				}
+			case EventTermChange:
+				tx.Run(ctx, `
+					MATCH (s:Server {id: $id}), (t:Term {value: $term})
+					OPTIONAL MATCH (s)-[old:CURRENT_TERM]->()
+					DELETE old
+					CREATE (s)-[:CURRENT_TERM {since: $ts}]->(t)
+				`, params)
+			case EventBecomeLeader:
+				tx.Run(ctx, `
+					MATCH (s:Server {id: $id}), (t:Term {value: $term})
+					MERGE (s)-[r:LEADER_OF]->(t)
+					SET r.timestamp = $ts
+				`, params)
+			case EventRPCSent:
+				if to, ok := e.Details["to"].(string); ok {
+					params["to"] = to
+					params["rpc"] = e.Details["rpc"]
+					tx.Run(ctx, "MATCH (s1:Server {id: $id}) MERGE (s2:Server {id: $to}) CREATE (s1)-[:SENT_RPC {type: $rpc, term: $term, timestamp: $ts, trace_id: $tid}]->(s2)", params)
+				}
 			}
-		case EventBecomeLeader:
-			tx.Run(ctx, "MATCH (s:Server {id: $id}), (t:Term {value: $term}) MERGE (s)-[r:LEADER_OF]->(t) SET r.timestamp = $ts", params)
-		case EventAppendLog:
-			tx.Run(ctx, "MATCH (s:Server {id: $id}) MERGE (e:LogEntry {index: $idx, term: $term}) MERGE (s)-[r:HAS_LOG_ENTRY]->(e) SET r.timestamp = $ts", params)
-		case EventCommit:
-			tx.Run(ctx, "MATCH (s:Server {id: $id}) MERGE (e:LogEntry {index: $idx, term: $term}) MERGE (s)-[r:APPLIED]->(e) SET r.timestamp = $ts, r.command = $details", params)
-		case EventRPCSent:
-			if to, ok := e.Details["to"].(string); ok {
-				params["to"] = to
-				params["rpc"] = e.Details["rpc"]
-				tx.Run(ctx, "MATCH (s1:Server {id: $id}) MERGE (s2:Server {id: $to}) CREATE (s1)-[:SENT_RPC {type: $rpc, term: $term, timestamp: $ts, details: $details}]->(s2)", params)
-			}
-		case EventRPCReceived:
-			if from, ok := e.Details["from"].(string); ok {
-				params["from"] = from
-				params["rpc"] = e.Details["rpc"]
-				tx.Run(ctx, "MATCH (s1:Server {id: $id}) MERGE (s2:Server {id: $from}) CREATE (s2)-[:SENT_RPC {type: $rpc, term: $term, timestamp: $ts, details: $details}]->(s1)", params)
-			}
-		case EventTruncateLog:
-			tx.Run(ctx, "MATCH (s:Server {id: $id})-[r:HAS_LOG_ENTRY]->(e:LogEntry) WHERE e.index >= $idx DELETE r", params)
 		}
 		return nil, nil
 	})
-	return err
+
+	if err != nil {
+		log.Printf("[Tracer] Batch write error: %v", err)
+	}
 }
 
 func (t *Tracer) Close() {
