@@ -175,7 +175,7 @@ func main() {
 	raftNode.Start() // starts the background election timer
 
 	// Initialize the HTTP API
-	apiServer := api.NewServer(raftNode, sm)
+	apiServer := api.NewServer(raftNode, sm, config)
 
 	// Register routes
 	mux := http.NewServeMux()
