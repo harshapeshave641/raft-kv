@@ -90,8 +90,8 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.proposeSem <- struct{}{}
+	defer func() { <-s.proposeSem }()
 	index, term := s.node.ProposeCommand(cmdBytes)
-	<-s.proposeSem
 
 	if index == 0 {
 		http.Error(w, "Not the leader", http.StatusTemporaryRedirect)
@@ -142,8 +142,8 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.proposeSem <- struct{}{}
+	defer func() { <-s.proposeSem }()
 	index, term := s.node.ProposeCommand(cmdBytes)
-	<-s.proposeSem
 
 	if index == 0 {
 		http.Error(w, "Not the leader", http.StatusTemporaryRedirect)
