@@ -10,3 +10,6 @@ data*/
 
 # Temporary test files
 body*.json
+
+# Environment Variables
+.env

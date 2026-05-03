@@ -13,6 +13,7 @@ import (
 	"syscall"
 
 	"raftkv/internal/api"
+	"raftkv/internal/config"
 	"raftkv/internal/persistence"
 	"raftkv/internal/raft"
 	"raftkv/internal/rpc"
@@ -25,10 +26,15 @@ func main() {
 	port := flag.Int("port", 3001, "HTTP server port")
 	dataDir := flag.String("data", "data", "Data directory")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peers (e.g. node2=localhost:3002,node3=localhost:3003)")
-	neo4jURI := flag.String("neo4j", "bolt://localhost:7687", "Neo4j Bolt URI")
-	neo4jUser := flag.String("neo4j-user", "neo4j", "Neo4j Username")
-	neo4jPass := flag.String("neo4j-pass", "password", "Neo4j Password")
+	envFlag := flag.String("env", "dev", "Environment (dev, staging, prod)")
 	flag.Parse()
+
+	// Load configuration
+	cfg, err := config.Load(*envFlag)
+	if err != nil {
+		log.Fatalf("Failed to load configuration: %v", err)
+	}
+	log.Printf("Loaded environment: %s", cfg.Environment)
 	
 	// Override port if PORT environment variable is set
 	if envPort := os.Getenv("PORT"); envPort != "" {
@@ -155,7 +161,7 @@ func main() {
 	transport := rpc.NewHTTPTransport()
 
 	// Initialize Tracer with Neo4j support
-	tracer, err := telemetry.NewTracer(*id, *neo4jURI, *neo4jUser, *neo4jPass)
+	tracer, err := telemetry.NewTracer(*id, cfg.Neo4j.URI, cfg.Neo4j.Username, cfg.Neo4j.Password)
 	if err != nil {
 		log.Printf("Warning: Failed to initialize tracer: %v", err)
 	}

@@ -1,0 +1,5 @@
+environment: dev
+neo4j:
+  uri: "bolt://localhost:7687"
+  username: ""
+  password: ""
