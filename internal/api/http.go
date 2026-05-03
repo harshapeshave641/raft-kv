@@ -11,12 +11,17 @@ import (
 )
 
 type Server struct {
-	node *raft.RaftNode
-	sm   *store.StateMachine
+	node       *raft.RaftNode
+	sm         *store.StateMachine
+	proposeSem chan struct{}
 }
 
 func NewServer(node *raft.RaftNode, sm *store.StateMachine) *Server {
-	return &Server{node: node, sm: sm}
+	return &Server{
+		node:       node,
+		sm:         sm,
+		proposeSem: make(chan struct{}, 5),
+	}
 }
 
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
@@ -84,7 +89,10 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.proposeSem <- struct{}{}
 	index, term := s.node.ProposeCommand(cmdBytes)
+	<-s.proposeSem
+
 	if index == 0 {
 		http.Error(w, "Not the leader", http.StatusTemporaryRedirect)
 		return
@@ -133,7 +141,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	s.proposeSem <- struct{}{}
 	index, term := s.node.ProposeCommand(cmdBytes)
+	<-s.proposeSem
+
 	if index == 0 {
 		http.Error(w, "Not the leader", http.StatusTemporaryRedirect)
 		return

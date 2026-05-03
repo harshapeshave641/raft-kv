@@ -7,10 +7,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"raftkv/internal/persistence"
 	"raftkv/internal/store"
 	"raftkv/internal/telemetry"
-	"github.com/google/uuid"
 )
 
 const snapshotThreshold = 200
