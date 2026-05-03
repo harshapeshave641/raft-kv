@@ -9,9 +9,10 @@ const (
 )
 
 type Command struct {
-	Type  CommandType
-	Key   string
-	Value string
+	Type      CommandType
+	Namespace string
+	Key       string
+	Value     string
 }
 
 type CommandResult struct {
