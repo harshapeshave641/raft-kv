@@ -195,7 +195,10 @@ func (n *RaftNode) executeActions(actions []Action) {
 			n.maybeCreateSnapshotLocked()
 
 		case ActionResetElectionTimer:
-			log.Printf("[RaftNode] Resetting election timer.")
+			if time.Since(n.lastTimerResetLog) > 5*time.Second {
+				log.Printf("[RaftNode] Resetting election timer.")
+				n.lastTimerResetLog = time.Now()
+			}
 			n.resetElectionTimerLocked()
 
 		case ActionSendRequestVote:

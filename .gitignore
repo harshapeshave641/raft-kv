@@ -3,6 +3,7 @@
 *.exe
 raft-kv
 raftkv
+raftkv-binary
 
 # Data directories
 data/
