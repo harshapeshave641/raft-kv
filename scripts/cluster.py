@@ -11,6 +11,7 @@ def parse_args():
     parser.add_argument("--nodes", type=int, default=3, help="Number of nodes to start")
     parser.add_argument("--data", choices=["old", "new"], default="old", help="Keep old data or start new")
     parser.add_argument("--env", type=str, default="dev", help="Environment config to use (dev, staging, prod)")
+    parser.add_argument("--no-neo4j", action="store_true", help="Do not start Neo4j container via docker-compose")
     return parser.parse_args()
 
 processes = []
@@ -25,8 +26,9 @@ def signal_handler(sig, frame):
 def main():
     args = parse_args()
     
-    print("Ensuring Neo4j is running...")
-    subprocess.run(["docker-compose", "up", "-d", "neo4j"], check=False)
+    if not args.no_neo4j:
+        print("Ensuring Neo4j is running...")
+        subprocess.run(["docker-compose", "up", "-d", "neo4j"], check=False)
 
     print("Building raftkv binary...")
     subprocess.run(["go", "build", "-o", "raftkv-binary", "cmd/raftkv/main.go"], check=True)
