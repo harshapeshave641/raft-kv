@@ -17,8 +17,9 @@ processes = []
 
 def signal_handler(sig, frame):
     print("\nShutting down cluster...")
-    for p in processes:
+    for p, f in processes:
         p.terminate()
+        f.close()
     sys.exit(0)
 
 def main():
@@ -74,8 +75,10 @@ def main():
             cmd.extend(["--peers", peers_str])
             
         print(f"Starting {config['id']} on port {config['port']}...")
-        p = subprocess.Popen(cmd)
-        processes.append(p)
+        log_file_path = os.path.join(config["data"], "raft.log")
+        log_file = open(log_file_path, "w")
+        p = subprocess.Popen(cmd, stdout=log_file, stderr=subprocess.STDOUT)
+        processes.append((p, log_file))
         
     print("-" * 48)
     print("CLUSTER ACTIVE")
@@ -87,7 +90,7 @@ def main():
     print("-" * 48)
     print("Press Ctrl+C to stop the cluster.")
     
-    for p in processes:
+    for p, _ in processes:
         p.wait()
 
 if __name__ == "__main__":
