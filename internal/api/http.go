@@ -38,6 +38,7 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /v1/n/{ns}/keys/{key}", s.handlePut)
 	mux.HandleFunc("DELETE /v1/n/{ns}/keys/{key}", s.handleDelete)
 	mux.HandleFunc("GET /v1/n/{ns}/keys", s.handleList)
+	mux.HandleFunc("DELETE /v1/n/{ns}", s.handleDeleteNamespace)
 
 	// Internal Raft RPC routes
 	mux.HandleFunc("POST /raft/request-vote", s.handleRequestVote)
@@ -194,6 +195,61 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 
 	log.Printf("[API] Proposed DELETE %s/%s (Index=%d, Term=%d)", ns, key, index, term)
+
+	// Wait for the command to be committed before returning success
+	timeout := time.After(5 * time.Second)
+	ticker := time.NewTicker(1 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-timeout:
+			http.Error(w, "Command not committed within timeout", http.StatusRequestTimeout)
+			return
+		case <-ticker.C:
+			if s.redirectToLeader(w, r) {
+				return
+			}
+			if s.node.CommitIndex() >= index {
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+		}
+	}
+}
+
+func (s *Server) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
+	if s.redirectToLeader(w, r) {
+		return
+	}
+
+	ns := s.getNamespace(r)
+	if ns == store.DefaultNamespace {
+		http.Error(w, "Cannot delete the default namespace", http.StatusForbidden)
+		return
+	}
+
+	cmd := store.Command{
+		Type:      store.CommandDeleteNamespace,
+		Namespace: ns,
+	}
+
+	cmdBytes, err := json.Marshal(cmd)
+	if err != nil {
+		http.Error(w, "Failed to marshal command", http.StatusInternalServerError)
+		return
+	}
+
+	s.proposeSem <- struct{}{}
+	defer func() { <-s.proposeSem }()
+	index, term := s.node.ProposeCommand(cmdBytes)
+
+	if index == 0 {
+		s.redirectToLeader(w, r)
+		return
+	}
+
+	log.Printf("[API] [%s] Proposed DELETE NAMESPACE (Index=%d, Term=%d)", ns, index, term)
 
 	// Wait for the command to be committed before returning success
 	timeout := time.After(5 * time.Second)

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"log"
 	"sync"
 )
 
@@ -26,16 +27,22 @@ func (sm *StateMachine) Apply(cmd Command) CommandResult {
 		ns = DefaultNamespace
 	}
 
-	if _, ok := sm.data[ns]; !ok {
+	if _, ok := sm.data[ns]; !ok && cmd.Type != CommandDeleteNamespace {
 		sm.data[ns] = make(map[string]string)
 	}
 
 	switch cmd.Type {
 	case CommandSet:
+		log.Printf("[SM] [%s] SET %s = %s", ns, cmd.Key, cmd.Value)
 		sm.data[ns][cmd.Key] = cmd.Value
 		return CommandResult{}
 	case CommandDelete:
+		log.Printf("[SM] [%s] DELETE %s", ns, cmd.Key)
 		delete(sm.data[ns], cmd.Key)
+		return CommandResult{}
+	case CommandDeleteNamespace:
+		log.Printf("[SM] [%s] WIPE NAMESPACE", ns)
+		delete(sm.data, ns)
 		return CommandResult{}
 	case CommandNoop:
 		return CommandResult{}
