@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RaftKV | Observability</title>
+    <script src="https://unpkg.com/neo4j-driver"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.26.0/cytoscape.min.js"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+    <div id="app">
+        <aside id="sidebar">
+            <header class="header">
+                <div class="logo">Raft<span>KV</span></div>
+                <div class="status-pill live">LIVE</div>
+            </header>
+
+            <section class="stat-section">
+                <div class="section-title">Cluster Overview</div>
+                <div class="stat-grid">
+                    <div class="stat-card">
+                        <div class="stat-label">Term</div>
+                        <div id="term-val" class="stat-value">0</div>
+                    </div>
+                    <div class="stat-card">
+                        <div class="stat-label">Health</div>
+                        <div id="health-val" class="stat-value">OK</div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="event-section">
+                <div class="section-title">Live Feed</div>
+                <div id="event-feed" class="event-feed"></div>
+            </section>
+        </aside>
+
+        <main id="viewport">
+            <div id="cy"></div>
+            <div class="timeline-bar">
+                <button class="btn-play" id="play-pause">⏸</button>
+                <div class="slider-wrap">
+                    <input type="range" id="time-slider" min="0" max="100" value="100">
+                    <div id="time-display" class="time-display">LIVE</div>
+                </div>
+            </div>
+            <div class="overlay-controls">
+                <button class="btn-icon" id="reset-layout" title="Reset Layout">⟲</button>
+            </div>
+        </main>
+
+        <aside id="inspector" class="hidden">
+            <header class="section-header">
+                <h2 id="inspect-node-id">Node: --</h2>
+                <button id="close-inspector">✕</button>
+            </header>
+            <div class="inspect-content">
+                <div class="stat-group">
+                    <div class="stat-item">
+                        <span class="label">Current Role</span>
+                        <span id="inspect-role" class="value">--</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="label">Term</span>
+                        <span id="inspect-term" class="value">--</span>
+                    </div>
+                </div>
+                <div class="section-title">Recent Node Events</div>
+                <div id="inspect-events" class="event-feed mini"></div>
+
+                <div class="section-title">Replicated Log</div>
+                <div id="inspect-log-strip" class="log-strip">
+                    <!-- Log indices will appear here -->
+                </div>
+            </div>
+        </aside>
+    </div>
+    <script src="js/api.js"></script>
+    <script src="js/graph.js"></script>
+    <script src="js/app.js"></script>
+</body>
+</html>
