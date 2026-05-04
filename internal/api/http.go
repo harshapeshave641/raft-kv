@@ -16,6 +16,7 @@ type Server struct {
 	sm         *store.StateMachine
 	config     raft.ClusterConfig
 	proposeSem chan struct{}
+	watchSem   chan struct{} // Semaphore for concurrent watchers
 }
 
 func NewServer(node *raft.RaftNode, sm *store.StateMachine, config raft.ClusterConfig) *Server {
@@ -24,6 +25,7 @@ func NewServer(node *raft.RaftNode, sm *store.StateMachine, config raft.ClusterC
 		sm:         sm,
 		config:     config,
 		proposeSem: make(chan struct{}, 5),
+		watchSem:   make(chan struct{}, 50), // Limit to 50 concurrent watchers
 	}
 }
 
@@ -303,8 +305,16 @@ func (s *Server) handleWatchKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] [%s] WATCH %s", ns, key)
+	// Try to acquire watch semaphore
+	select {
+	case s.watchSem <- struct{}{}:
+		defer func() { <-s.watchSem }()
+	default:
+		http.Error(w, "Too many concurrent watchers", http.StatusTooManyRequests)
+		return
+	}
 
+	log.Printf("[API] [%s] WATCH %s", ns, key)
 	s.serveWatch(w, r, ns, key, true)
 }
 
@@ -314,8 +324,17 @@ func (s *Server) handleWatchNamespace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := s.getNamespace(r)
-	log.Printf("[API] [%s] WATCH NAMESPACE", ns)
 
+	// Try to acquire watch semaphore
+	select {
+	case s.watchSem <- struct{}{}:
+		defer func() { <-s.watchSem }()
+	default:
+		http.Error(w, "Too many concurrent watchers", http.StatusTooManyRequests)
+		return
+	}
+
+	log.Printf("[API] [%s] WATCH NAMESPACE", ns)
 	s.serveWatch(w, r, ns, "", false)
 }
 
