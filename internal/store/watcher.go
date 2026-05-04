@@ -8,7 +8,7 @@ type WatchEvent struct {
 	Namespace string `json:"namespace"`
 	Key       string `json:"key"`
 	Value     string `json:"value,omitempty"`
-	Type      string `json:"type"` // "set" or "delete"
+	Type      string `json:"type"` // "set", "delete", "wipe"
 }
 
 type WatcherRegistry struct {
@@ -28,7 +28,7 @@ func (wr *WatcherRegistry) SubscribeKey(ns, key string) chan WatchEvent {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()
 
-	ch := make(chan WatchEvent, 10)
+	ch := make(chan WatchEvent, 64) // Larger buffer for bursty updates
 	fullKey := ns + ":" + key
 	wr.keyWatchers[fullKey] = append(wr.keyWatchers[fullKey], ch)
 	return ch
@@ -38,7 +38,7 @@ func (wr *WatcherRegistry) SubscribeNamespace(ns string) chan WatchEvent {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()
 
-	ch := make(chan WatchEvent, 10)
+	ch := make(chan WatchEvent, 64)
 	wr.nsWatchers[ns] = append(wr.nsWatchers[ns], ch)
 	return ch
 }
@@ -51,9 +51,16 @@ func (wr *WatcherRegistry) UnsubscribeKey(ns, key string, ch chan WatchEvent) {
 	watchers := wr.keyWatchers[fullKey]
 	for i, w := range watchers {
 		if w == ch {
-			wr.keyWatchers[fullKey] = append(watchers[:i], watchers[i+1:]...)
-			close(ch)
-			break
+			// Efficient delete without memory leaks
+			copy(watchers[i:], watchers[i+1:])
+			watchers[len(watchers)-1] = nil
+			wr.keyWatchers[fullKey] = watchers[:len(watchers)-1]
+			
+			// Clean up map entry if no more watchers
+			if len(wr.keyWatchers[fullKey]) == 0 {
+				delete(wr.keyWatchers, fullKey)
+			}
+			return
 		}
 	}
 }
@@ -65,9 +72,15 @@ func (wr *WatcherRegistry) UnsubscribeNamespace(ns string, ch chan WatchEvent) {
 	watchers := wr.nsWatchers[ns]
 	for i, w := range watchers {
 		if w == ch {
-			wr.nsWatchers[ns] = append(watchers[:i], watchers[i+1:]...)
-			close(ch)
-			break
+			// Efficient delete without memory leaks
+			copy(watchers[i:], watchers[i+1:])
+			watchers[len(watchers)-1] = nil
+			wr.nsWatchers[ns] = watchers[:len(watchers)-1]
+
+			if len(wr.nsWatchers[ns]) == 0 {
+				delete(wr.nsWatchers, ns)
+			}
+			return
 		}
 	}
 }
@@ -78,20 +91,24 @@ func (wr *WatcherRegistry) Notify(event WatchEvent) {
 
 	// Notify key watchers
 	fullKey := event.Namespace + ":" + event.Key
-	for _, ch := range wr.keyWatchers[fullKey] {
-		select {
-		case ch <- event:
-		default:
-			// Buffer full, skip to avoid blocking the whole cluster
+	if watchers, ok := wr.keyWatchers[fullKey]; ok {
+		for _, ch := range watchers {
+			select {
+			case ch <- event:
+			default:
+				// Buffer full, skip to avoid blocking the leader
+			}
 		}
 	}
 
 	// Notify namespace watchers
-	for _, ch := range wr.nsWatchers[event.Namespace] {
-		select {
-		case ch <- event:
-		default:
-			// Buffer full, skip
+	if watchers, ok := wr.nsWatchers[event.Namespace]; ok {
+		for _, ch := range watchers {
+			select {
+			case ch <- event:
+			default:
+				// Buffer full, skip
+			}
 		}
 	}
 }
