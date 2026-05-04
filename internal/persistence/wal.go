@@ -150,7 +150,7 @@ func (w *WAL) filterLocked(keepFn func(uint64) bool) error {
 	var keep [][]byte
 	for _, record := range all {
 		var entry struct {
-			Index uint64 `json:"Index"`
+			Index uint64 `json:"index"`
 		}
 		if err := json.Unmarshal(record, &entry); err != nil {
 			return err // corrupted JSON

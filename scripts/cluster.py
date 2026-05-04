@@ -9,7 +9,7 @@ import signal
 def parse_args():
     parser = argparse.ArgumentParser(description="Start Raft KV Cluster")
     parser.add_argument("--nodes", type=int, default=3, help="Number of nodes to start")
-    parser.add_argument("--data", choices=["old", "new"], default="old", help="Keep old data or start new")
+    parser.add_argument("--data", default="new", help="Data directory strategy or path")
     parser.add_argument("--env", type=str, default="dev", help="Environment config to use (dev, staging, prod)")
     parser.add_argument("--no-neo4j", action="store_true", help="Do not start Neo4j container via docker-compose")
     return parser.parse_args()
@@ -45,13 +45,16 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     base_port = 3000
-    
+    base_data = args.data
+    if base_data == "new" or base_data == "old":
+        base_data = "data"
+
     # Pre-calculate nodes
     node_configs = []
     for i in range(1, args.nodes + 1):
         node_id = f"node{i}"
         port = base_port + i
-        data_dir = os.path.join("data", node_id)
+        data_dir = os.path.join(base_data, node_id)
         os.makedirs(data_dir, exist_ok=True)
         node_configs.append({"id": node_id, "port": port, "data": data_dir})
         
@@ -85,7 +88,7 @@ def main():
     print("-" * 48)
     print("CLUSTER ACTIVE")
     for config in node_configs:
-        print(f"{config['id']}: http://localhost:{config['port']}")
+        print(f"{config['id']}: https://localhost:{config['port']}")
     print("-" * 48)
     print("To start UI: python3 -m http.server 8080 --directory ui")
     print("Then visit: http://localhost:8080")

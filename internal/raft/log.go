@@ -1,4 +1,4 @@
-﻿package raft
+package raft
 
 import "sync"
 
@@ -94,19 +94,22 @@ func (l *RaftLog) GetEntry(index Index) (LogEntry, bool) {
 func (l *RaftLog) GetEntriesFrom(index Index) []LogEntry {
     l.mu.RLock()
     defer l.mu.RUnlock()
-    if len(l.entries) == 0 {
+
+    if index <= l.baseIndex {
         return nil
     }
-    if index <= l.baseIndex+1 {
-        result := make([]LogEntry, len(l.entries))
-        copy(result, l.entries)
-        return result
-    }
+
     if index > l.LastIndex() {
         return nil
     }
+
     pos := index - l.baseIndex - 1
-    result := make([]LogEntry, len(l.entries)-int(pos))
+    if pos >= Index(len(l.entries)) {
+        return nil
+    }
+
+    count := Index(len(l.entries)) - pos
+    result := make([]LogEntry, count)
     copy(result, l.entries[pos:])
     return result
 }

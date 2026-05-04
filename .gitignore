@@ -1,16 +1,19 @@
-# Build artifacts
-/build/
-*.exe
-raft-kv
-raftkv
+# Binaries
 raftkv-binary
+node1
+node2
+node3
 
 # Data directories
 data/
-data*/
+chaos_data/
+*.log
+*.pem
+known_peers.json
+snapshot.json
+state.json
 
-# Temporary test files
-body*.json
-
-# Environment Variables
+# IDEs
+.vscode/
+.idea/
 .env

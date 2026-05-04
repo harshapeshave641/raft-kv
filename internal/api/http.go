@@ -1,12 +1,16 @@
 package api
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"time"
 
+	"raftkv/internal/auth"
+	"raftkv/internal/config"
 	"raftkv/internal/raft"
 	"raftkv/internal/store"
 )
@@ -16,21 +20,61 @@ type Server struct {
 	sm         *store.StateMachine
 	config     raft.ClusterConfig
 	proposeSem chan struct{}
-	watchSem   chan struct{} // Semaphore for concurrent watchers
+	watchSem   chan struct{}
+	identity   *auth.Identity
+	tofu       *auth.TOFURegistry
 }
 
-func NewServer(node *raft.RaftNode, sm *store.StateMachine, config raft.ClusterConfig) *Server {
+func NewServer(node *raft.RaftNode, sm *store.StateMachine, clusterCfg raft.ClusterConfig, identity *auth.Identity, tofu *auth.TOFURegistry) *Server {
 	return &Server{
 		node:       node,
 		sm:         sm,
-		config:     config,
-		proposeSem: make(chan struct{}, 5),
-		watchSem:   make(chan struct{}, 50), // Limit to 50 concurrent watchers
+		config:     clusterCfg,
+		proposeSem: make(chan struct{}, config.MaxProposeConcurrency),
+		watchSem:   make(chan struct{}, config.MaxConcurrentWatchers),
+		identity:   identity,
+		tofu:       tofu,
 	}
 }
 
+func (s *Server) ListenAndServe(addr string) error {
+	mux := http.NewServeMux()
+	s.RegisterRoutes(mux)
+
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{s.identity.Certificate},
+		ClientAuth:   tls.RequestClientCert, // Request cert, but don't fail if CA is unknown
+		// Bypass default verification to allow self-signed certs.
+		// Security is instead handled by TOFU in VerifyConnection.
+		VerifyPeerCertificate: func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+			return nil
+		},
+		// Custom verification for TOFU
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return nil // Might be a non-Raft client (like a browser/curl)
+			}
+			cert := cs.PeerCertificates[0]
+			nodeID := cert.Subject.CommonName
+			
+			// We only enforce TOFU if the CommonName looks like a NodeID
+			// For standard clients, they won't have a NodeID CommonName.
+			return s.tofu.VerifyPeer(nodeID, cert)
+		},
+	}
+
+	server := &http.Server{
+		Addr:      addr,
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
+
+	log.Printf("[API] Starting SECURE server on %s (Fingerprint: %s)", addr, s.identity.Fingerprint)
+	return server.ListenAndServeTLS("", "") // Certs are already in TLSConfig
+}
+
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	// Client API routes (Backward compatibility for "default" namespace)
+	// Client API routes
 	mux.HandleFunc("GET /v1/keys/{key}", s.handleGet)
 	mux.HandleFunc("PUT /v1/keys/{key}", s.handlePut)
 	mux.HandleFunc("DELETE /v1/keys/{key}", s.handleDelete)
@@ -59,7 +103,8 @@ func (s *Server) redirectToLeader(w http.ResponseWriter, r *http.Request) bool {
 	leaderID := s.node.LeaderID()
 	for _, n := range s.config.Nodes {
 		if n.ID == leaderID {
-			leaderAddr := fmt.Sprintf("http://%s:%d%s", n.Host, n.Port, r.URL.Path)
+			// Switch to https for redirection
+			leaderAddr := fmt.Sprintf("https://%s:%d%s", n.Host, n.Port, r.URL.Path)
 			w.Header().Set("Location", leaderAddr)
 			w.WriteHeader(http.StatusTemporaryRedirect)
 			return true
@@ -72,7 +117,7 @@ func (s *Server) redirectToLeader(w http.ResponseWriter, r *http.Request) bool {
 func (s *Server) getNamespace(r *http.Request) string {
 	ns := r.PathValue("ns")
 	if ns == "" {
-		return store.DefaultNamespace
+		return config.DefaultNamespace
 	}
 	return ns
 }
@@ -89,8 +134,6 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] [%s] GET %s", ns, key)
-	
 	val, ok := s.sm.Get(ns, key)
 	if !ok {
 		http.Error(w, "Key not found", http.StatusNotFound)
@@ -137,17 +180,15 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 
 	s.proposeSem <- struct{}{}
 	defer func() { <-s.proposeSem }()
-	index, term := s.node.ProposeCommand(cmdBytes)
+	index, _ := s.node.ProposeCommand(cmdBytes)
 
 	if index == 0 {
 		s.redirectToLeader(w, r)
 		return
 	}
 
-	log.Printf("[API] [%s] Proposed SET %s (Index=%d, Term=%d)", ns, key, index, term)
-
-	// Wait for the command to be committed before returning success
-	timeout := time.After(5 * time.Second)
+	// Wait for the command to be committed
+	timeout := time.After(config.WriteCommitTimeout)
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -194,17 +235,14 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 
 	s.proposeSem <- struct{}{}
 	defer func() { <-s.proposeSem }()
-	index, term := s.node.ProposeCommand(cmdBytes)
+	index, _ := s.node.ProposeCommand(cmdBytes)
 
 	if index == 0 {
 		s.redirectToLeader(w, r)
 		return
 	}
 
-	log.Printf("[API] [%s] Proposed DELETE %s (Index=%d, Term=%d)", ns, key, index, term)
-
-	// Wait for the command to be committed before returning success
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(config.WriteCommitTimeout)
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -231,7 +269,7 @@ func (s *Server) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := s.getNamespace(r)
-	if ns == store.DefaultNamespace {
+	if ns == config.DefaultNamespace {
 		http.Error(w, "Cannot delete the default namespace", http.StatusForbidden)
 		return
 	}
@@ -249,17 +287,14 @@ func (s *Server) handleDeleteNamespace(w http.ResponseWriter, r *http.Request) {
 
 	s.proposeSem <- struct{}{}
 	defer func() { <-s.proposeSem }()
-	index, term := s.node.ProposeCommand(cmdBytes)
+	index, _ := s.node.ProposeCommand(cmdBytes)
 
 	if index == 0 {
 		s.redirectToLeader(w, r)
 		return
 	}
 
-	log.Printf("[API] [%s] Proposed DELETE NAMESPACE (Index=%d, Term=%d)", ns, index, term)
-
-	// Wait for the command to be committed before returning success
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(config.WriteCommitTimeout)
 	ticker := time.NewTicker(1 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -286,8 +321,6 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := s.getNamespace(r)
-	log.Printf("[API] [%s] LIST", ns)
-
 	keys := s.sm.Keys(ns)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string][]string{"keys": keys})
@@ -305,7 +338,6 @@ func (s *Server) handleWatchKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Try to acquire watch semaphore
 	select {
 	case s.watchSem <- struct{}{}:
 		defer func() { <-s.watchSem }()
@@ -314,7 +346,6 @@ func (s *Server) handleWatchKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] [%s] WATCH %s", ns, key)
 	s.serveWatch(w, r, ns, key, true)
 }
 
@@ -325,7 +356,6 @@ func (s *Server) handleWatchNamespace(w http.ResponseWriter, r *http.Request) {
 
 	ns := s.getNamespace(r)
 
-	// Try to acquire watch semaphore
 	select {
 	case s.watchSem <- struct{}{}:
 		defer func() { <-s.watchSem }()
@@ -334,7 +364,6 @@ func (s *Server) handleWatchNamespace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] [%s] WATCH NAMESPACE", ns)
 	s.serveWatch(w, r, ns, "", false)
 }
 
@@ -359,7 +388,6 @@ func (s *Server) serveWatch(w http.ResponseWriter, r *http.Request, ns, key stri
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 
-	// Send initial "connected" event
 	fmt.Fprintf(w, "data: {\"status\": \"connected\", \"namespace\": \"%s\"}\n\n", ns)
 	flusher.Flush()
 
