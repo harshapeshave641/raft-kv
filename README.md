@@ -1,114 +1,121 @@
-# RaftKV — Distributed Replicated Key-Value Store
+# RaftKV: Distributed Replicated Coordination Engine
 
-RaftKV is a strongly consistent, fault-tolerant, and durable distributed key-value store built in Go using the **Raft Consensus Algorithm**. It is designed for systems where data integrity and high availability are paramount.
-
-##  Architecture
-
-The system is built on a modular, decoupled architecture that separates pure logic from side effects, making it highly testable and resilient.
-
-### **1. RaftCore (The Brain)**
-*   **Location:** `internal/raft/core.go`
-*   **Role:** A "pure" state machine implementation of the Raft protocol.
-*   **Details:** It handles leader election, log replication, and commitment logic. It has zero I/O and zero network dependencies; it simply consumes events and returns a list of "Actions" to be performed.
-
-### **2. RaftNode (The Orchestrator)**
-*   **Location:** `internal/raft/node.go`
-*   **Role:** The bridge between the pure `RaftCore` and the real world.
-*   **Details:** Manages concurrency (mutexes), executes disk I/O (WAL/StateStore), handles network RPCs via the Transport layer, and applies committed entries to the State Machine.
-
-### **3. Persistence Layer**
-*   **WAL (Write-Ahead Log):** Ensures every log entry is durable on disk before it is acknowledged or replicated.
-*   **StateStore:** Persists volatile metadata like `currentTerm` and `votedFor` to survive crashes.
-
-### **4. Networking & API**
-*   **HTTP Transport:** Handles inter-node communication (JSON-over-HTTP).
-*   **Client API:** Provides a RESTful interface for external clients to interact with the KV store.
+RaftKV is a strongly consistent, fault-tolerant, and durable distributed key-value store built in Go. It leverages the Raft Consensus Algorithm to ensure data integrity across a cluster of nodes, providing a reliable foundation for distributed coordination, configuration management, and real-time state synchronization.
 
 ---
 
-##  Getting Started
+## 1. System Architecture
 
-### **Prerequisites**
-*   Go 1.22 or higher
+The system is designed with a strict separation of concerns, decoupling pure consensus logic from side-effect-heavy operations like disk I/O and networking.
 
-### **Build**
-```bash
-go build -o raftkv.exe ./cmd/raftkv
-```
+### Core Components
 
-### **Run a 3-Node Cluster (Local Test)**
+#### RaftCore (Pure Consensus Engine)
+The RaftCore is a deterministic, "pure" implementation of the Raft protocol. It does not perform any I/O or networking. Instead, it consumes events (ticks, RPC requests, responses) and returns a list of abstract "Actions" (e.g., PersistState, SendRPC, ApplyCommand). This design ensures the core logic is highly testable and independent of the execution environment.
 
-Open three terminal windows and run the following commands to start a local cluster:
+#### RaftNode (The Orchestrator)
+The RaftNode serves as the execution layer for the RaftCore. It manages:
+- **Concurrency Control:** Using mutexes to protect the volatile state of the node.
+- **Physical Persistence:** Executing disk writes for the Write-Ahead Log (WAL) and StateStore.
+- **Event Loops:** Managing election timers and heartbeat tickers.
+- **RPC Coordination:** Interfacing with the Transport layer to send and receive cluster messages.
 
-**Node 1:**
-```bash
-./raftkv.exe --id node1 --port 3001 --data data1 --peers "node2=localhost:3002,node3=localhost:3003"
-```
-
-**Node 2:**
-```bash
-./raftkv.exe --id node2 --port 3002 --data data2 --peers "node1=localhost:3001,node3=localhost:3003"
-```
-
-**Node 3:**
-```bash
-./raftkv.exe --id node3 --port 3003 --data data3 --peers "node1=localhost:3001,node2=localhost:3002"
-```
+#### State Machine (Multi-Tenant Storage)
+The storage engine is a thread-safe, namespace-aware key-value store. It is integrated directly with the Watch API, ensuring that every state transition (SET, DELETE, WIPE) is immediately broadcast to relevant subscribers.
 
 ---
 
-##  Client API Reference
+## 2. Advanced Features and Capabilities
 
-All write operations must go through the **Leader**. Reads are also restricted to the Leader to ensure **Linearizability**.
+### Multi-Tenancy and Isolation
+RaftKV implements logical partitioning through **Namespaces**.
+- **Data Isolation:** Every key belongs to a specific namespace, preventing collisions between different applications sharing the same cluster.
+- **Namespace Management:** Supports atomic operations at the namespace level, including full namespace wipes.
+- **Defaulting:** Operations that omit a namespace are automatically routed to the "default" partition for backward compatibility.
 
-### **1. Set a Key**
-```bash
-curl -X PUT http://localhost:3001/v1/keys/my-key -H "Content-Type: application/json" -d '{"value": "hello-world"}'
-```
-*Returns `202 Accepted` once the command is proposed.*
+### Real-Time Watch API (SSE)
+A reactive event system based on Server-Sent Events (SSE).
+- **Fan-Out Architecture:** Uses a centralized `WatcherRegistry` to manage thousands of concurrent subscribers.
+- **Non-Blocking Delivery:** Implements a buffered channel-per-subscriber model to ensure that slow-consuming clients do not block the progress of the Raft State Machine.
+- **Granular Filters:** Clients can subscribe to specific keys or monitor entire namespaces for broad visibility.
 
-### **2. Get a Key**
-```bash
-curl http://localhost:3001/v1/keys/my-key
-```
-*If the node is not the leader, it returns a `307 Temporary Redirect` with the Leader ID.*
+### Backpressure and Load Protection
+To ensure system stability under extreme load, RaftKV utilizes **Semaphores** as a backpressure mechanism:
+- **Proposal Semaphore:** Limits the number of concurrent Raft proposals. This prevents the node from overwhelming the disk subsystem and network buffers during write bursts.
+- **Watch Semaphore:** Limits the number of active SSE connections. This protects the server from memory exhaustion and socket starvation caused by excessive streaming clients.
 
-### **3. Delete a Key**
-```bash
-curl -X DELETE http://localhost:3001/v1/keys/my-key
-```
-
-### **4. List All Keys**
-```bash
-curl http://localhost:3001/v1/keys
-```
-
----
-
-##  Testing and Fault Tolerance
-
-### **Automatic Recovery**
-Upon startup, the server automatically:
-1.  Loads the **WAL** from disk.
-2.  **Replays** all log entries into the in-memory State Machine.
-3.  Resumes the Raft protocol from the last known state.
-
-### **Failover Test**
-1.  Identify the current Leader from the logs (e.g., `node1`).
-2.  Kill the leader process.
-3.  Observe the logs of other nodes as they detect the failure and elect a **new leader** within ~300ms.
-4.  Restart the old leader and observe it rejoining the cluster and catching up.
-
-### **Unit Tests**
-Run the comprehensive test suite for the core consensus logic:
-```bash
-go test ./internal/raft/...
-```
+### Zero-Config TOFU mTLS Security
+RaftKV provides industry-standard security with zero manual configuration.
+- **Identity Generation:** Every node generates a unique Ed25519 self-signed certificate upon initialization.
+- **Trust-On-First-Use (TOFU):** Nodes automatically "pin" the fingerprints of their peers during the initial handshake.
+- **mTLS Enforcement:** All inter-node communication is encrypted and mutually authenticated. If a peer's certificate changes, the connection is rejected to prevent Man-in-the-Middle attacks.
 
 ---
 
-##  Tech Stack
-*   **Language:** Go (Standard Library)
-*   **Consensus:** Raft (Strongly Consistent)
-*   **Transport:** JSON over HTTP/1.1
-*   **Storage:** Append-only WAL (File-based)
+## 3. System Flows
+
+### The Write Path (Commit Cycle)
+1. **Request Ingress:** A client sends a PUT request to the API.
+2. **Backpressure Check:** The API acquires a slot in the `proposeSem`.
+3. **Proposal:** The command is proposed to the `RaftNode`.
+4. **Durability:** The leader writes the entry to its local WAL.
+5. **Replication:** The leader replicates the log entry to followers via HTTPS.
+6. **Quorum:** Once a majority acknowledges the entry, the leader marks it as committed.
+7. **Application:** The `RaftNode` applies the command to the State Machine.
+8. **Notification:** The State Machine triggers the `WatcherRegistry` to push the event to active SSE clients.
+9. **Response:** The API returns success to the client.
+
+### The Watch Path
+1. **Subscription:** A client opens an SSE connection to `/v1/watch`.
+2. **Resource Guard:** The server acquires a slot in the `watchSem`.
+3. **Registry:** The client is added to the `WatcherRegistry` with a dedicated event channel.
+4. **Streaming:** As the State Machine processes commands, events are pushed into the client's channel and flushed over the HTTPS connection.
+5. **Cleanup:** If the client disconnects, the channel is closed, the registry is pruned, and the semaphore slot is released.
+
+---
+
+## 4. API Reference
+
+All requests must use **HTTPS**. Use the `-k` flag with curl for self-signed certificates.
+
+### Key-Value Operations
+- `PUT /v1/n/{ns}/keys/{key}`: Set a value. Requires JSON body `{"value": "..."}`.
+- `GET /v1/n/{ns}/keys/{key}`: Retrieve a value.
+- `DELETE /v1/n/{ns}/keys/{key}`: Remove a key.
+- `GET /v1/n/{ns}/keys`: List all keys in a namespace.
+
+### Streaming Operations
+- `GET /v1/n/{ns}/watch`: Stream all events for a namespace.
+- `GET /v1/n/{ns}/watch/{key}`: Stream events for a specific key.
+
+---
+
+## 5. Operations and Maintenance
+
+### Building the Project
+```bash
+go build -o raftkv-binary cmd/raftkv/main.go
+```
+
+### Running a Cluster
+Use the provided automation script to start a local 3-node cluster:
+```bash
+python3 scripts/cluster.py --nodes 3 --data new
+```
+
+### Configuration and Tuning
+System parameters are centralized in `internal/config/constants.go`. Key parameters include:
+- `SnapshotThreshold`: Frequency of log compaction (default: 200 entries).
+- `HeartbeatInterval`: Leader heartbeat frequency (default: 50ms).
+- `MaxConcurrentWatchers`: Maximum SSE streaming clients (default: 50).
+- `MaxProposeConcurrency`: Maximum simultaneous write proposals (default: 5).
+
+---
+
+## 6. Observability and Debugging (In Progress)
+
+Debugging distributed consensus systems like Raft is notoriously difficult due to the complex interleaving of network events, timeouts, and state transitions. To address this, development is underway on an observability suite centered around **Neo4j**.
+
+- **Event Ingestion:** Every significant Raft event (e.g., Term changes, Vote requests, Log appends, State transitions) is ingested into a Neo4j graph database.
+- **Visualization:** By representing the cluster state as a graph, the relationship between different nodes, the flow of log entries, and the lineage of leader elections can be visualized.
+- **Advanced Debugging:** This graph-based approach allows for complex queries to identify split-brain scenarios, trace the cause of election storms, and verify safety properties in real-time.
