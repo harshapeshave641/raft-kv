@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -13,6 +12,7 @@ import (
 	"syscall"
 
 	"raftkv/internal/api"
+	"raftkv/internal/auth"
 	"raftkv/internal/config"
 	"raftkv/internal/persistence"
 	"raftkv/internal/raft"
@@ -29,6 +29,11 @@ func main() {
 	envFlag := flag.String("env", "dev", "Environment (dev, staging, prod)")
 	flag.Parse()
 
+	// Ensure data directory exists
+	if err := os.MkdirAll(*dataDir, 0755); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
 	// Load configuration
 	cfg, err := config.Load(*envFlag)
 	if err != nil {
@@ -41,6 +46,17 @@ func main() {
 		if p, err := strconv.Atoi(envPort); err == nil {
 			*port = p
 		}
+	}
+
+	// TOFU mTLS Initialization
+	identity, err := auth.LoadOrGenerateIdentity(*dataDir, *id)
+	if err != nil {
+		log.Fatalf("Failed to load/generate identity: %v", err)
+	}
+
+	tofu, err := auth.NewTOFURegistry(*dataDir)
+	if err != nil {
+		log.Fatalf("Failed to initialize TOFU registry: %v", err)
 	}
 
 	// Initialize the Phase 1 state machine
@@ -103,8 +119,6 @@ func main() {
 	log.Printf("Recovered %d entries into RaftLog. Last index: %d", len(entries), raftLog.LastIndex())
 
 	// Replay committed entries into State Machine
-	// For now, we assume everything in the WAL was committed on restart.
-	// In a full Raft implementation, this would be drive by the persistent commitIndex or Snapshot.
 	for _, entry := range entries {
 		var cmd store.Command
 		if err := json.Unmarshal(entry.Command, &cmd); err != nil {
@@ -158,7 +172,8 @@ func main() {
 		Nodes:  nodes,
 	}
 
-	transport := rpc.NewHTTPTransport()
+	// Initialize the secure transport
+	transport := rpc.NewHTTPTransport(tofu, identity)
 
 	// Initialize Tracer with Neo4j support
 	tracer, err := telemetry.NewTracer(*id, cfg.Neo4j.URI, cfg.Neo4j.Username, cfg.Neo4j.Password)
@@ -174,25 +189,10 @@ func main() {
 
 	raftNode.Start() // starts the background election timer
 
-	// Initialize the HTTP API
-	apiServer := api.NewServer(raftNode, sm, config)
-
-	// Register routes
-	mux := http.NewServeMux()
-	apiServer.RegisterRoutes(mux)
-
-	// Phase 0 endpoints
-	mux.HandleFunc("GET /ping", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("pong"))
-	})
-	mux.HandleFunc("GET /status", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("ok"))
-	})
+	// Initialize the Secure HTTP API
+	apiServer := api.NewServer(raftNode, sm, config, identity, tofu)
 
 	addr := fmt.Sprintf(":%d", *port)
-	log.Printf("Starting RaftKV server on %s", addr)
-
-	server := &http.Server{Addr: addr, Handler: mux}
 
 	// Handle graceful shutdown
 	go func() {
@@ -201,10 +201,10 @@ func main() {
 		<-sigChan
 		log.Printf("Shutting down...")
 		raftNode.Stop()
-		server.Close()
+		os.Exit(0)
 	}()
 
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := apiServer.ListenAndServe(addr); err != nil {
 		log.Fatalf("Server failed: %v", err)
 	}
 }

@@ -2,24 +2,45 @@ package rpc
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 
+	"raftkv/internal/auth"
 	"raftkv/internal/raft"
 )
 
 type HTTPTransport struct {
 	client *http.Client
+	tofu   *auth.TOFURegistry
 }
 
-func NewHTTPTransport() *HTTPTransport {
+func NewHTTPTransport(tofu *auth.TOFURegistry, identity *auth.Identity) *HTTPTransport {
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{identity.Certificate},
+		// We use InsecureSkipVerify because we are using self-signed certs
+		// and we will verify the fingerprint in the round tripper or handler.
+		InsecureSkipVerify: true,
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			if len(cs.PeerCertificates) == 0 {
+				return fmt.Errorf("no peer certificates")
+			}
+			cert := cs.PeerCertificates[0]
+			nodeID := cert.Subject.CommonName
+			return tofu.VerifyPeer(nodeID, cert)
+		},
+	}
+
 	return &HTTPTransport{
 		client: &http.Client{
-			Timeout: 100 * time.Millisecond, // Fast timeout for Raft
+			Timeout: 200 * time.Millisecond,
+			Transport: &http.Transport{
+				TLSClientConfig: tlsConfig,
+			},
 		},
+		tofu: tofu,
 	}
 }
 
@@ -29,8 +50,7 @@ func (t *HTTPTransport) SendRequestVote(peerID raft.NodeID, peerAddress string, 
 		return raft.RequestVoteReply{}, err
 	}
 
-	url := fmt.Sprintf("http://%s/raft/request-vote", peerAddress)
-	log.Printf("[HTTPTransport] POST %s", url)
+	url := fmt.Sprintf("https://%s/raft/request-vote", peerAddress)
 	resp, err := t.client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return raft.RequestVoteReply{}, err
@@ -50,11 +70,7 @@ func (t *HTTPTransport) SendAppendEntries(peerID raft.NodeID, peerAddress string
 		return raft.AppendEntriesReply{}, err
 	}
 
-	url := fmt.Sprintf("http://%s/raft/append-entries", peerAddress)
-	// Don't log heartbeats to avoid spam, but log if there are entries
-	if len(args.Entries) > 0 {
-		log.Printf("[HTTPTransport] POST %s (%d entries)", url, len(args.Entries))
-	}
+	url := fmt.Sprintf("https://%s/raft/append-entries", peerAddress)
 	resp, err := t.client.Post(url, "application/json", bytes.NewReader(data))
 	if err != nil {
 		return raft.AppendEntriesReply{}, err
