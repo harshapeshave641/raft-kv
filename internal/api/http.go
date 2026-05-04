@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 	"time"
+
 	"raftkv/internal/raft"
 	"raftkv/internal/store"
 )
@@ -32,6 +33,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /v1/keys/{key}", s.handlePut)
 	mux.HandleFunc("DELETE /v1/keys/{key}", s.handleDelete)
 	mux.HandleFunc("GET /v1/keys", s.handleList)
+	mux.HandleFunc("GET /v1/watch/{key}", s.handleWatchKey)
+	mux.HandleFunc("GET /v1/watch", s.handleWatchNamespace)
 
 	// Namespace-aware routes
 	mux.HandleFunc("GET /v1/n/{ns}/keys/{key}", s.handleGet)
@@ -39,6 +42,8 @@ func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("DELETE /v1/n/{ns}/keys/{key}", s.handleDelete)
 	mux.HandleFunc("GET /v1/n/{ns}/keys", s.handleList)
 	mux.HandleFunc("DELETE /v1/n/{ns}", s.handleDeleteNamespace)
+	mux.HandleFunc("GET /v1/n/{ns}/watch/{key}", s.handleWatchKey)
+	mux.HandleFunc("GET /v1/n/{ns}/watch", s.handleWatchNamespace)
 
 	// Internal Raft RPC routes
 	mux.HandleFunc("POST /raft/request-vote", s.handleRequestVote)
@@ -82,7 +87,7 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] GET /v1/%s/keys/%s", ns, key)
+	log.Printf("[API] [%s] GET %s", ns, key)
 	
 	val, ok := s.sm.Get(ns, key)
 	if !ok {
@@ -137,7 +142,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] Proposed PUT %s/%s = %s (Index=%d, Term=%d)", ns, key, reqBody.Value, index, term)
+	log.Printf("[API] [%s] Proposed SET %s (Index=%d, Term=%d)", ns, key, index, term)
 
 	// Wait for the command to be committed before returning success
 	timeout := time.After(5 * time.Second)
@@ -194,7 +199,7 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[API] Proposed DELETE %s/%s (Index=%d, Term=%d)", ns, key, index, term)
+	log.Printf("[API] [%s] Proposed DELETE %s (Index=%d, Term=%d)", ns, key, index, term)
 
 	// Wait for the command to be committed before returning success
 	timeout := time.After(5 * time.Second)
@@ -279,11 +284,76 @@ func (s *Server) handleList(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ns := s.getNamespace(r)
-	log.Printf("[API] LIST /v1/%s/keys", ns)
+	log.Printf("[API] [%s] LIST", ns)
 
 	keys := s.sm.Keys(ns)
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string][]string{"keys": keys})
+}
+
+func (s *Server) handleWatchKey(w http.ResponseWriter, r *http.Request) {
+	if s.redirectToLeader(w, r) {
+		return
+	}
+
+	ns := s.getNamespace(r)
+	key := r.PathValue("key")
+	if key == "" {
+		http.Error(w, "Key is required", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("[API] [%s] WATCH %s", ns, key)
+
+	s.serveWatch(w, r, ns, key, true)
+}
+
+func (s *Server) handleWatchNamespace(w http.ResponseWriter, r *http.Request) {
+	if s.redirectToLeader(w, r) {
+		return
+	}
+
+	ns := s.getNamespace(r)
+	log.Printf("[API] [%s] WATCH NAMESPACE", ns)
+
+	s.serveWatch(w, r, ns, "", false)
+}
+
+func (s *Server) serveWatch(w http.ResponseWriter, r *http.Request, ns, key string, isKeyWatch bool) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	var ch chan store.WatchEvent
+	if isKeyWatch {
+		ch = s.sm.Watchers.SubscribeKey(ns, key)
+		defer s.sm.Watchers.UnsubscribeKey(ns, key, ch)
+	} else {
+		ch = s.sm.Watchers.SubscribeNamespace(ns)
+		defer s.sm.Watchers.UnsubscribeNamespace(ns, ch)
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Send initial "connected" event
+	fmt.Fprintf(w, "data: {\"status\": \"connected\", \"namespace\": \"%s\"}\n\n", ns)
+	flusher.Flush()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event := <-ch:
+			data, _ := json.Marshal(event)
+			fmt.Fprintf(w, "data: %s\n\n", string(data))
+			flusher.Flush()
+		}
+	}
 }
 
 func (s *Server) handleRequestVote(w http.ResponseWriter, r *http.Request) {

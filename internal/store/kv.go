@@ -8,13 +8,15 @@ import (
 const DefaultNamespace = "default"
 
 type StateMachine struct {
-	mu   sync.RWMutex
-	data map[string]map[string]string // Namespace -> Key -> Value
+	mu       sync.RWMutex
+	data     map[string]map[string]string // Namespace -> Key -> Value
+	Watchers *WatcherRegistry
 }
 
 func NewStateMachine() *StateMachine {
 	return &StateMachine{
-		data: make(map[string]map[string]string),
+		data:     make(map[string]map[string]string),
+		Watchers: NewWatcherRegistry(),
 	}
 }
 
@@ -35,17 +37,42 @@ func (sm *StateMachine) Apply(cmd Command) CommandResult {
 	case CommandSet:
 		log.Printf("[SM] [%s] SET %s = %s", ns, cmd.Key, cmd.Value)
 		sm.data[ns][cmd.Key] = cmd.Value
+		
+		// Notify watchers
+		sm.Watchers.Notify(WatchEvent{
+			Namespace: ns,
+			Key:       cmd.Key,
+			Value:     cmd.Value,
+			Type:      "set",
+		})
 		return CommandResult{}
+
 	case CommandDelete:
 		log.Printf("[SM] [%s] DELETE %s", ns, cmd.Key)
 		delete(sm.data[ns], cmd.Key)
+		
+		// Notify watchers
+		sm.Watchers.Notify(WatchEvent{
+			Namespace: ns,
+			Key:       cmd.Key,
+			Type:      "delete",
+		})
 		return CommandResult{}
+
 	case CommandDeleteNamespace:
 		log.Printf("[SM] [%s] WIPE NAMESPACE", ns)
 		delete(sm.data, ns)
+		
+		// Notify watchers of namespace-wide wipe
+		sm.Watchers.Notify(WatchEvent{
+			Namespace: ns,
+			Type:      "wipe",
+		})
 		return CommandResult{}
+
 	case CommandNoop:
 		return CommandResult{}
+
 	default:
 		return CommandResult{Error: "unknown command type"}
 	}
