@@ -59,7 +59,7 @@ func (r *TOFURegistry) load() error {
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(data, &r.KnownPeers)
+	return json.Unmarshal(data, r)
 }
 
 func (r *TOFURegistry) save() error {
