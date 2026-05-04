@@ -6,6 +6,7 @@ import (
     "errors"
     "hash/crc32"
     "io"
+    "log"
     "os"
     "path/filepath"
     "sync"
@@ -157,8 +158,11 @@ func (w *WAL) filterLocked(keepFn func(uint64) bool) error {
 		}
 		if keepFn(entry.Index) {
 			keep = append(keep, record)
+		} else {
+			log.Printf("[WAL] Discarding entry at index %d", entry.Index)
 		}
 	}
+	log.Printf("[WAL] Filtered: kept %d records, discarded %d", len(keep), len(all)-len(keep))
 
 	if len(keep) == len(all) {
 		return nil // nothing to do

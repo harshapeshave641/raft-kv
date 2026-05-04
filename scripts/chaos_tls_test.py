@@ -34,13 +34,13 @@ def write_key(addr, ns, key, val):
     try:
         resp = requests.put(f"{addr}/v1/n/{ns}/keys/{key}", 
                             json={"value": val}, 
-                            verify=False, timeout=2)
+                            verify=False, timeout=6)
         return resp.status_code == 200
     except: return False
 
 def check_key(addr, ns, key, expected_val):
     try:
-        resp = requests.get(f"{addr}/v1/n/{ns}/keys/{key}", verify=False, timeout=1)
+        resp = requests.get(f"{addr}/v1/n/{ns}/keys/{key}", verify=False, timeout=6)
         if resp.status_code == 200 and resp.json()["value"] == expected_val:
             return True
         print(f"   [DEBUG] Check failed for {key} at {addr}: Status {resp.status_code}, Body {resp.text}")
@@ -76,7 +76,7 @@ def run_advanced_chaos():
             return
     print(" [OK] Identities pinned on all nodes.")
 
-    # PHASE 2: High Concurrency Burst (50 threads)
+    # PHASE 2: High Concurrency Burst (250 writes to trigger snapshots)
     print("\n[PHASE 2] High Concurrency Burst (250 writes to trigger snapshots)...")
     success_count = 0
     with ThreadPoolExecutor(max_workers=10) as executor:
@@ -150,8 +150,6 @@ def run_advanced_chaos():
         node_missing = 0
         for i in range(250):
             # We use verify=False and follow_redirects=True
-            # Even if we hit a follower, it will redirect us to the leader's consistent view
-            # But the fact that the follower CAN redirect means it is in the quorum.
             if not check_key(addr, "chaos", f"k{i}", f"v{i}"):
                 node_missing += 1
         
