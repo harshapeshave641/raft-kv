@@ -3,12 +3,16 @@ import time
 import requests
 import json
 import threading
+import urllib3
+
+# Disable insecure request warnings for self-signed certs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 def run_watcher(results):
     print(" Watcher started...")
-    # Use -N for unbuffered output
+    # Use -N for unbuffered output and -k for insecure
     process = subprocess.Popen(
-        ["curl", "-s", "-N", "-L", "http://localhost:3001/v1/n/watch-test/watch/mykey"],
+        ["curl", "-s", "-N", "-L", "-k", "https://localhost:3001/v1/n/watch-test/watch/mykey"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True
@@ -41,12 +45,12 @@ def test_watch():
     
     # 2. Trigger Events
     print(" Sending PUT...")
-    requests.put("http://localhost:3001/v1/n/watch-test/keys/mykey", json={"value": "pulse-1"})
+    requests.put("https://localhost:3001/v1/n/watch-test/keys/mykey", json={"value": "pulse-1"}, verify=False)
     
     time.sleep(1)
     
     print(" Sending DELETE...")
-    requests.delete("http://localhost:3001/v1/n/watch-test/keys/mykey")
+    requests.delete("https://localhost:3001/v1/n/watch-test/keys/mykey", verify=False)
     
     watch_thread.join(timeout=10)
     

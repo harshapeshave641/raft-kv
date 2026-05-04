@@ -85,7 +85,7 @@ def main():
     print("-" * 48)
     print("CLUSTER ACTIVE")
     for config in node_configs:
-        print(f"{config['id']}: http://localhost:{config['port']}")
+        print(f"{config['id']}: https://localhost:{config['port']}")
     print("-" * 48)
     print("To start UI: python3 -m http.server 8080 --directory ui")
     print("Then visit: http://localhost:8080")
